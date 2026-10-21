@@ -1,0 +1,45 @@
+name: Production health
+
+# A failed scheduled run emails the repo owner: that is the alert when the
+# live map silently falls back to climatology or stops refreshing.
+#
+# Manual-only for now. Until this backend is deployed on Render with
+# PURPLEAIR_API_KEY set there, /api/health has no live_neighbors field or
+# reports "degraded" by design, so a schedule would fail and email every 30
+# min. Once a manual run passes, enable alerts by adding:
+#   schedule:
+#     - cron: '*/30 * * * *'
+# GitHub emails the person who last edited the cron line, so the repo owner
+# should make that edit.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check /api/health
+        env:
+          HEALTH_URL: https://shared-skies-backend.onrender.com/api/health
+        run: |
+          # A spun-down free instance takes up to a minute to answer, then
+          # reports "degraded" until its startup compute lands, so retry for
+          # about 10 minutes before calling it down.
+          for attempt in 1 2 3 4 5 6 7 8; do
+            body=$(curl -fsS --connect-timeout 20 --max-time 60 "$HEALTH_URL" || true)
+            status=$(jq -r '.status' <<<"$body" 2>/dev/null || true)
+            live=$(jq -r '.live_neighbors' <<<"$body" 2>/dev/null || true)
+            if [ "$status" = "ok" ] && [ "$live" = "true" ]; then
+              jq . <<<"$body"
+              exit 0
+            fi
+            echo "Attempt $attempt: status=${status:-none} live_neighbors=${live:-none}"
+            if [ "$attempt" -lt 8 ]; then sleep 30; fi
+          done
+          echo "Last response:"
+          jq . <<<"$body" 2>/dev/null || echo "${body:-<no response>}"
+          echo "::error::/api/health status=${status:-none} live_neighbors=${live:-none}"
+          exit 1
