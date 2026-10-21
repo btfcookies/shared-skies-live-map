@@ -5,11 +5,13 @@ centroids, and elevations. Output: a training-ready CSV with maximum row count
 within budget, with QC filtering applied.
 
 Strategy (per the project doc "Maximizing 1M PurpleAir API Points"):
-  - Pull pm2.5_atm only from PurpleAir (2 pts/row). Source weather from Open-Meteo
+  - Pull pm2.5_atm only from PurpleAir (one field keeps the per-row cost
+    down; see the cost note below). Source weather from Open-Meteo
     historical archive at training time so train-serve distribution matches the
     backend's live inference path (which already calls Open-Meteo).
   - 1-day-average history is capped at 2-year windows per call → chunk pulls.
-  - Resume-safe: every API response is cached to disk; reruns skip cached chunks.
+  - Resume-safe: every successful (HTTP 200) response is cached to disk; reruns
+    skip cached chunks. Failures are never cached, so a rerun retries them.
   - Budget-aware: track points consumed; stop pulling new sensors when remaining
     budget falls below a per-sensor reserve.
 
@@ -71,16 +73,29 @@ TODAY = date.fromisoformat(_pull_today_env) if _pull_today_env else date.today()
 EARLIEST_START = date(2021, 1, 1)
 LATEST_END = TODAY - timedelta(days=1)
 
-# Budget. PurpleAir READ key → 1,000,000 points/month. Reserve 50k for safety.
+# Per-run spending cap for the ledger below, not the account balance (PurpleAir
+# points are bought per organization; check the dashboard). Reserve 50k for safety.
 TOTAL_BUDGET = 1_000_000
 SAFETY_RESERVE = 50_000
 EFFECTIVE_BUDGET = TOTAL_BUDGET - SAFETY_RESERVE
 
-# Cost model (per PurpleAir docs):
-#   GET /v1/sensors                      → 2 + 2 * fields_count * sensors_returned
-#   GET /v1/sensors/{id}/history         → 2 + 2 * fields_count * rows_returned
-# We pull 1 PA field (pm2.5_atm) so per-history-call ≈ 2 + 2 * rows.
+# Cost model. The ledger below charges 2 + 2 * fields_count * rows per call, an
+# older reading of PurpleAir's docs that was never checked against the account.
+# The one measured figure (2026-10-20, the live map's statewide /v1/sensors
+# call) is 3,484 points for 497 rows with 6 fields: about 7 points per row per
+# call. That is empirical, not a published rate, and history calls were not
+# measured, so treat the ledger as an estimate and check the real balance on the
+# PurpleAir dashboard before a large pull.
 PA_HISTORY_FIELDS = ["pm2.5_atm"]
+
+# Retry schedule (seconds) for 429, 5xx and network errors on history calls. A
+# window that still fails is skipped for this run and NOT cached, so a rerun
+# retries it.
+PA_RETRY_DELAYS = (10, 30, 60, 120, 300)
+# Key rejected (401), out of points (402) or forbidden (403): every later call
+# would fail the same way, so the run halts rather than marching on.
+PA_HALT_STATUSES = {401, 402, 403}
+SKIPPED_WINDOWS: list[str] = []
 
 # QC thresholds: PM2.5 outside this range is sensor noise / fault.
 # 200 µg/m³ is past EPA "Hazardous" (250.4+ AQI) and at the upper edge of
@@ -232,6 +247,61 @@ def chunked_windows(start: date, end: date, max_days: int = 730) -> list[tuple[d
     return windows
 
 
+def _retry_after_s(r: requests.Response, default: float) -> float:
+    try:
+        return max(default, float(r.headers.get("Retry-After", "")))
+    except ValueError:
+        return default
+
+
+def fetch_history_chunk(sid: int, w_start: date, w_end: date) -> Optional[dict]:
+    """One history call with retries. Returns the 200 payload, or None when the
+    window should be skipped for this run. Only a 200 is ever cached: an empty
+    chunk written for a failure would make every rerun skip that window for good."""
+    params = dict(
+        start_timestamp=int(datetime.combine(w_start, datetime.min.time(), tzinfo=timezone.utc).timestamp()),
+        end_timestamp=int(datetime.combine(w_end, datetime.min.time(), tzinfo=timezone.utc).timestamp()),
+        average=1440,
+        fields=",".join(PA_HISTORY_FIELDS),
+    )
+    label = f"sensor {sid} {w_start}..{w_end}"
+    for attempt in range(len(PA_RETRY_DELAYS) + 1):
+        delay = PA_RETRY_DELAYS[min(attempt, len(PA_RETRY_DELAYS) - 1)]
+        try:
+            r = requests.get(
+                f"https://api.purpleair.com/v1/sensors/{sid}/history",
+                headers={"X-API-Key": API_KEY},
+                params=params,
+                timeout=60,
+            )
+        except requests.RequestException as e:
+            reason = f"network error: {e}"
+        else:
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code in PA_HALT_STATUSES:
+                raise SystemExit(
+                    f"[halt] {label} → HTTP {r.status_code}: {r.text[:200]}\n"
+                    f"Nothing was cached for this window; fix the key or add points, "
+                    f"then rerun (finished windows are read from the cache)."
+                )
+            if r.status_code != 429 and r.status_code < 500:
+                # Other 4xx (e.g. a removed sensor): retrying will not help.
+                print(f"[err] {label} → HTTP {r.status_code}: {r.text[:200]} (skipped, not cached)")
+                SKIPPED_WINDOWS.append(label)
+                return None
+            reason = f"HTTP {r.status_code}"
+            if r.status_code == 429:
+                delay = _retry_after_s(r, delay)
+        if attempt == len(PA_RETRY_DELAYS):
+            break
+        print(f"[retry] {label}: {reason}; retry {attempt + 1}/{len(PA_RETRY_DELAYS)} in {delay:.0f}s")
+        time.sleep(delay)
+    print(f"[err] {label}: still failing after {len(PA_RETRY_DELAYS)} retries ({reason}); skipped, not cached")
+    SKIPPED_WINDOWS.append(label)
+    return None
+
+
 def pull_sensor_history(sensor: dict, sensor_start: date, end: date) -> Optional[pd.DataFrame]:
     """Pull pm2.5_atm daily averages for one sensor across [sensor_start, end).
     Returns concatenated DataFrame or None if pull fully failed."""
@@ -239,40 +309,20 @@ def pull_sensor_history(sensor: dict, sensor_start: date, end: date) -> Optional
     frames = []
     for w_start, w_end in chunked_windows(sensor_start, end, max_days=720):
         cache = history_chunk_path(sid, w_start, w_end)
-        if cache.exists():
-            payload = json.loads(cache.read_text())
-        else:
+        payload = json.loads(cache.read_text()) if cache.exists() else None
+        # Older versions of this script cached failures as empty "_error" chunks;
+        # those are re-fetched rather than trusted as real empty windows.
+        if payload is not None and "_error" in payload:
+            payload = None
+        if payload is None:
             # Budget gate before each call: assume worst-case 2-year chunk = ~1462 pts
             est_cost = 2 + 2 * len(PA_HISTORY_FIELDS) * (w_end - w_start).days
             if LEDGER.remaining() < est_cost + 5_000:
                 print(f"[budget] STOP — {LEDGER.remaining()} pts left, would not fit {est_cost} for sensor {sid} {w_start}..{w_end}")
                 return None
-            params = dict(
-                start_timestamp=int(datetime.combine(w_start, datetime.min.time(), tzinfo=timezone.utc).timestamp()),
-                end_timestamp=int(datetime.combine(w_end, datetime.min.time(), tzinfo=timezone.utc).timestamp()),
-                average=1440,
-                fields=",".join(PA_HISTORY_FIELDS),
-            )
-            try:
-                r = requests.get(
-                    f"https://api.purpleair.com/v1/sensors/{sid}/history",
-                    headers={"X-API-Key": API_KEY},
-                    params=params,
-                    timeout=60,
-                )
-            except Exception as e:
-                print(f"[net-err] sensor {sid} {w_start}: {e}")
+            payload = fetch_history_chunk(sid, w_start, w_end)
+            if payload is None:
                 continue
-            if r.status_code == 429:
-                print(f"[rate] 429 — sleeping 30s")
-                time.sleep(30)
-                continue
-            if r.status_code != 200:
-                print(f"[err] sensor {sid} {w_start}..{w_end} → HTTP {r.status_code}: {r.text[:200]}")
-                # Cache an empty payload so we don't retry this same window forever
-                cache.write_text(json.dumps({"data": [], "fields": ["time_stamp"] + PA_HISTORY_FIELDS, "_error": r.text[:500]}))
-                continue
-            payload = r.json()
             cache.write_text(json.dumps(payload))
             rows = payload.get("data", [])
             charge("history", len(PA_HISTORY_FIELDS), len(rows))
@@ -351,6 +401,13 @@ def fetch_open_meteo(lat: float, lon: float, start: date, end: date) -> Optional
     df = pd.DataFrame(daily)
     df["date"] = pd.to_datetime(df["time"]).dt.normalize()
     df = df.drop(columns=["time"])
+    # Cache files written before wind_speed_unit=ms was added are km/h, and the
+    # cache key ignores units, so a rerun can read them back. Convert by the file's
+    # own daily_units (same rule as 08's load_open_meteo) so every row is m/s.
+    units = payload.get("daily_units") or {}
+    for col in ("wind_speed_10m_max", "wind_gusts_10m_max"):
+        if col in df.columns and "km" in str(units.get(col, "")).lower():
+            df[col] = df[col] / 3.6
     df["latitude"] = lat
     df["longitude"] = lon
     return df
@@ -502,6 +559,10 @@ def main():
             n_rows = sum(len(f) for f in all_pa_frames)
             print(f"[progress] {i}/{len(pull_order)} sensors | {n_rows:,} new rows | "
                   f"{LEDGER.points_used:,} pts used | {LEDGER.remaining():,} remaining")
+
+    if SKIPPED_WINDOWS:
+        print(f"[warn] {len(SKIPPED_WINDOWS)} history windows failed and were skipped "
+              f"(not cached); rerun to fill them. First few: {SKIPPED_WINDOWS[:5]}")
 
     # Step 5: union with existing 2025 data
     if all_pa_frames:

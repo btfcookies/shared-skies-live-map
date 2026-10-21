@@ -2,9 +2,12 @@
 
 Full retrain of the Shared Skies live-map PM2.5 ensemble on GT PACE Phoenix,
 using the AQNet v4 PurpleAir archival pull (started August 8, 2026) merged with
-the existing production dataset. Training methodology is byte-identical to
-production (`pipeline/03_train_enhanced.py`, unmodified); only the
-leave-one-site-out loop was parallelized across a 24-task SLURM array.
+the existing production dataset. Data loading, features, models and
+hyperparameters come from `pipeline/03_train_enhanced.py`, imported
+unmodified. The steps of its `__main__` and its leave-one-site-out loop were
+re-implemented in `train_full.py`, `loso_shard.py` and `loso_merge.py` so the
+loop could run as a 24-task SLURM array. They follow 03's logic but are not
+03 itself, so this is not a byte-identical rerun of production.
 
 **The production files in `models/` at the repo root are untouched.** Everything
 from this run lives in this folder. Promotion to the live site is a deliberate
@@ -41,7 +44,9 @@ Built by `scripts/build_dataset.py` in the exact 41-column schema of
   sensors.
 - **Old part**: the shipped production dataset for the 325 sensors not in the
   new pull (sensors that have died since, plus out-of-state border neighbors),
-  and gap-fill days for overlapping sensors (new rows win on conflicts).
+  and gap-fill days for overlapping sensors (new rows win on conflicts). It
+  still carries 39,105 of the legacy 2025 rows whose PM2.5 is not raw
+  `pm2.5_atm` (see Known limitations in the top-level README).
 - **Covariates, all rebuilt fresh through Aug 7, 2026**: per-sensor Open-Meteo
   daily weather (all 505 sensors, 99.99% row coverage, zero NASA POWER
   fallbacks), NOAA HMS smoke via the shared train/serve point-in-polygon code
@@ -50,7 +55,7 @@ Built by `scripts/build_dataset.py` in the exact 41-column schema of
   (89 new sensors audited, 25 outside Texas kept as neighbors only).
 
 Final table: **434,986 rows, 499 sensors, 2021-01-01 to 2026-08-07**
-(production was 412,507 rows, 467 sensors, ending in July 2026).
+(production was 412,507 rows, 467 sensors, 2021-01-01 to 2026-05-01).
 
 ## Results
 
@@ -63,18 +68,18 @@ with GroupKFold-over-sensors cross-fit (the honest, no-optimism number).
 |---|---|---|
 | LOSO R2, optimized weights (headline) | 0.7134 | **0.7076** |
 | LOSO R2, inverse-MSE baseline | 0.7090 | 0.7020 |
-| LOSO RMSE (ug/m3) | 4.2486 | 4.2828 |
+| LOSO RMSE (ug/m3), inverse-MSE baseline | 4.2486 | 4.2828 |
 | LOSO sites | 310 | 319 |
 | Random-split ensemble R2 | 0.8033 | 0.8058 |
 | Chosen weights | RF .794 / LGBM .070 / CAT .136 | RF .818 / LGBM .182 |
 | Sensors / rows | 467 / 412,507 | 499 / 434,986 |
-| Data ends | 2026-07 | 2026-08-07 |
+| Data ends | 2026-05-01 | 2026-08-07 |
 
 Read: the new model is statistically indistinguishable from production on
 spatial generalization (0.708 vs 0.713 pooled LOSO R2, on a slightly larger
 and partly different fold population), while being trained on fresher data
-with 32 more sensors and five more weeks of coverage, including the smoke
-periods of summer 2026. Single-model LOSO R2: RF 0.7069, CAT 0.6941, LGBM
+with 32 more sensors and about 14 more weeks of coverage, including the
+smoke periods of summer 2026. Single-model LOSO R2: RF 0.7069, CAT 0.6941, LGBM
 0.6937, XGB 0.6816. The convex optimizer again kept RF dominant and zeroed
 XGB; CatBoost dropped out this round in favor of LightGBM.
 
@@ -95,9 +100,9 @@ stopped at 43%, the effective new signal is 174 refreshed sensors rather than
   `sensor_tx_membership.csv`.
 - `scripts/` - everything that ran on Phoenix: dataset builder, covariate
   pullers (weather, HMS, cells, membership), the three wrappers that
-  parallelize the unmodified production training script (`train_full.py`,
-  `loso_shard.py`, `loso_merge.py`), and the SLURM job generator and
-  dependency-chained submitter.
+  re-implement the production script's main flow and LOSO loop around its
+  imported functions (`train_full.py`, `loso_shard.py`, `loso_merge.py`), and
+  the SLURM job generator and dependency-chained submitter.
 - `logs/` - the build, train, and merge job logs from Phoenix.
 
 ## Promoting to production
@@ -112,7 +117,22 @@ root. To ship this model:
     cp "8-8-26 huge retrain/models/sensor_recent_pm.json" models/
     cp "8-8-26 huge retrain/dataset/sensor_tx_membership.csv" pipeline/
 
-then commit and push (Render redeploys from main). Given the flat headline
+The backend also reads `dist_to_nearest_sensor` from `models/training_sensors.json`,
+which must be regenerated from this run's 499-sensor dataset before shipping:
+
+    python pipeline/14_export_training_sensors.py \
+        --source-path "8-8-26 huge retrain/dataset/p2_processed_v3.parquet"
+
+The test suite pins the shipped model and sensor set, so CI goes red until
+these are regenerated in the same commit (see Running tests in the top-level
+README): `GOLDEN_MEAN` / `GOLDEN_TRACTS` in `tests/test_model.py`, the
+467-sensor count and 7.80 km / 54.0 km tract-to-sensor distances in
+`tests/test_features.py`, and `num_existing_sensors == 467` in
+`tests/test_api.py`. Note that `tests/test_features.py` also checks
+`models/training_sensors.json` against an export of the production parquet,
+so that test must be pointed at this dataset too.
+
+Then commit and push (Render redeploys from main). Given the flat headline
 number, shipping is optional until the full pull completes; the strongest
 argument for shipping now is the fresher climatology fallback and residual map.
 

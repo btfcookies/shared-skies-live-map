@@ -23,6 +23,14 @@ Design (matches the committed artifact):
                      delta vs arm A (resample sensors, not rows: residuals are
                      spatially clustered and a row bootstrap understates CIs).
 
+Known optimism: the nbr_* neighbor features come from load_data(), which builds
+them once from the FULL sensor pool (leave-self-out only). They are not
+recomputed per fold the way loso_cv() does, so a held-out sensor's features
+still average same-day readings from other held-out sensors. The absolute R2,
+RMSE and MAE of every arm are therefore optimistic and are not comparable to
+the deployed LOSO score. The arm-vs-arm deltas remain comparable, because all
+three arms share the same neighbor features and folds.
+
 Run from the repo root:
     python pipeline/13_ablation_ejscreen.py
     python pipeline/13_ablation_ejscreen.py --folds 10 --boot 2000

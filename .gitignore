@@ -46,5 +46,18 @@ backend/visits.sqlite
 # pipeline/03_train_enhanced.py, used only by pipeline/eval_calibration.py).
 # All headline numbers are in models/metrics.json.
 models/loso_oof.npz
+# Per-shard LOSO checkpoints from the parallel retrain wrappers
+# ("8-8-26 huge retrain/scripts/loso_shard.py"); merged into the files above.
+models/loso_shard_*.joblib
+models/loso_shard_*.joblib.tmp
 .vercel
+
+# Secrets. backend/.env holds the PurpleAir READ key for local runs; it is
+# listed explicitly so the rule survives any edit to the .env* pattern.
 .env*
+backend/.env
+
+# Training / test byproducts and the local venv the README suggests
+catboost_info/
+.pytest_cache/
+.venv/

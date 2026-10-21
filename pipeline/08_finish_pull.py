@@ -154,10 +154,13 @@ def load_open_meteo(lat: float, lon: float) -> Optional[pd.DataFrame]:
     df = df.drop(columns=["time"])
     df = df.rename(columns=OPEN_METEO_RENAME)
     df["weather_source"] = "open_meteo"
-    # Open-Meteo defaults to km/h; convert to m/s so all rows share NASA POWER's unit.
-    # Without this, trees learn a "which source?" split instead of weather→PM physics.
-    for col in ("wind_speed", "wind_gusts"):
-        if col in df.columns:
+    # All rows must share NASA POWER's m/s, or trees learn a "which source?" split
+    # instead of weather→PM physics. The existing cache files are km/h (Open-Meteo's
+    # default), but 06 now requests wind_speed_unit=ms, so convert only what the
+    # file's own daily_units say is km/h; dividing a fresh m/s pull would shrink it.
+    units = payload.get("daily_units") or {}
+    for raw, col in (("wind_speed_10m_max", "wind_speed"), ("wind_gusts_10m_max", "wind_gusts")):
+        if col in df.columns and "km" in str(units.get(raw, "")).lower():
             df[col] = df[col] / 3.6
     return df
 
