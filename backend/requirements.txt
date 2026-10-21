@@ -1,21 +1,26 @@
-fastapi
-uvicorn[standard]
-pandas
-numpy
-scikit-learn
-lightgbm
-xgboost
-# Pin catboost to the version the v3b ensemble.joblib was trained with — keeps
-# pickle compat stable across Render rebuilds. ~97 MB prebuilt cp311 wheel.
+# Exact pins. models/ensemble.joblib is a pickle: scikit-learn, LightGBM,
+# CatBoost, XGBoost and numpy must stay at versions that can unpickle it and
+# reproduce its predictions, and an unpinned rebuild on Render can silently
+# pull a release that can't. These match the verified test environments
+# (Python 3.11 and 3.12 load the bundle with identical predictions). Bump
+# deliberately, re-check predictions, then deploy.
+fastapi==0.141.1
+uvicorn[standard]==0.37.0
+httpx==0.28.1
+pandas==2.2.2
+numpy==2.4.6
+scipy==1.17.1
+scikit-learn==1.8.0
+lightgbm==4.6.0
+# XGBoost carries zero blend weight but is still needed to unpickle the bundle.
+xgboost==3.2.0
 catboost==1.2.10
-joblib
-pyarrow
-httpx
-openpyxl
-xlrd
-dwave-neal
-dimod
-networkx
+joblib==1.5.3
+pyarrow==16.1.0
+# Sensor-placement solver (imported lazily on the first solve).
+dwave-neal==0.6.0
+dimod==0.12.21
+networkx==3.6.1
 # NOAA HMS smoke polygon parsing — pure-Python (no GDAL dependency).
 # shapely 2.x manylinux wheel bundles GEOS so no apt deps needed on Render.
 pyshp==2.3.1

@@ -130,22 +130,35 @@ async def fetch_cell_features(cell_centers, include_met: bool = True) -> dict:
     return out
 
 
+# Bumped whenever the meaning of a weather-grid value changes, so a snapshot
+# written by older code (e.g. daily-MEAN wind) is never reused as model input.
+WEATHER_GRID_SCHEMA = 2
+
+
 async def fetch_weather_grid(lats, lons) -> dict:
-    """Fetch TODAY'S DAILY-MEAN weather per 0.5° grid cell, in TRAINING UNITS.
+    """Fetch TODAY'S (UTC day) daily weather per 1.0° grid cell, in TRAINING UNITS.
 
-    The model trains on daily aggregates: temperature °C, humidity %, SURFACE
-    pressure hPa, wind m/s, precipitation mm/day — per sensor location. This
-    mirrors that at inference: per-cell daily means applied per tract, replacing
-    the old single-point instantaneous fetch (which was °F/mph/MSL — units the
-    model was never trained on).
+    The model trains on daily aggregates: mean temperature °C, mean humidity %,
+    mean SURFACE pressure hPa, MAXIMUM 10 m wind m/s, precipitation mm/day, per
+    sensor location. Training wind is the daily max on both of its sources
+    (Open-Meteo archive wind_speed_10m_max converted from km/h, NASA POWER
+    WS10M_MAX in m/s), so serving requests wind_speed_10m_max in m/s too; the
+    daily mean runs about 31% lower and would bias the model.
 
-    Returns {'features': {feat: [per-tract values or None]}, 'usable': bool}.
+    Returns {'features': {feat: [per-tract values or None]}, 'usable': bool,
+    'n_cells', 'fetched_at', 'schema'}.
     """
     cells, idx = build_cells(lats, lons, grid_deg=WEATHER_GRID_DEG)
     feat_names = ["temperature", "humidity", "pressure", "wind_speed", "precipitation"]
     per_tract = {f: [None] * len(lats) for f in feat_names}
+    fetched_at = datetime.now(timezone.utc).isoformat()
+
+    def _result(usable: bool) -> dict:
+        return {"features": per_tract, "usable": usable, "n_cells": len(cells),
+                "fetched_at": fetched_at, "schema": WEATHER_GRID_SCHEMA}
+
     if not cells:
-        return {"features": per_tract, "usable": False, "n_cells": 0}
+        return _result(False)
 
     lat_s = ",".join(f"{c[0]:.4f}" for c in cells)
     lon_s = ",".join(f"{c[1]:.4f}" for c in cells)
@@ -155,13 +168,13 @@ async def fetch_weather_grid(lats, lons) -> dict:
             r = await client.get(MET_URL, params={
                 "latitude": lat_s, "longitude": lon_s,
                 "daily": ("temperature_2m_mean,relative_humidity_2m_mean,"
-                          "surface_pressure_mean,wind_speed_10m_mean,precipitation_sum"),
+                          "surface_pressure_mean,wind_speed_10m_max,precipitation_sum"),
                 "wind_speed_unit": "ms",   # training wind is m/s
                 "forecast_days": 1, "timezone": "UTC",
             })
             if r.status_code != 200:
                 print(f"[weather-grid] HTTP {r.status_code}: {r.text[:160]}")
-                return {"features": per_tract, "usable": False, "n_cells": len(cells)}
+                return _result(False)
             payload = r.json()
             if isinstance(payload, dict):
                 if payload.get("error"):
@@ -174,16 +187,25 @@ async def fetch_weather_grid(lats, lons) -> dict:
                 def first(key):
                     v = d.get(key) or [None]
                     return v[0] if v else None
+                wind = first("wind_speed_10m_max")
+                # Guard the unit rather than trust the request param: the
+                # model expects m/s, and km/h would read 3.6x too windy.
+                wind_unit = (loc.get("daily_units") or {}).get("wind_speed_10m_max", "m/s")
+                if wind is not None and wind_unit == "km/h":
+                    wind = wind / 3.6
                 cell_vals[i] = {
                     "temperature":   first("temperature_2m_mean"),       # °C
                     "humidity":      first("relative_humidity_2m_mean"), # %
                     "pressure":      first("surface_pressure_mean"),     # hPa (surface)
-                    "wind_speed":    first("wind_speed_10m_mean"),       # m/s
+                    "wind_speed":    wind,                               # m/s, daily max
                     "precipitation": first("precipitation_sum"),         # mm/day
                 }
+            units = (payload[0].get("daily_units") or {}) if payload else {}
+            print(f"[weather-grid] {len(cell_vals)} cells, wind unit "
+                  f"{units.get('wind_speed_10m_max')!r} (daily max)")
     except Exception as e:
         print(f"[weather-grid] fetch error: {e}")
-        return {"features": per_tract, "usable": False, "n_cells": len(cells)}
+        return _result(False)
 
     usable = False
     for i in range(len(lats)):
@@ -193,7 +215,7 @@ async def fetch_weather_grid(lats, lons) -> dict:
             per_tract[f][i] = v
             if v is not None:
                 usable = True
-    return {"features": per_tract, "usable": usable, "n_cells": len(cells)}
+    return _result(usable)
 
 
 def conditions_cell_key(lat: float, lon: float) -> str:

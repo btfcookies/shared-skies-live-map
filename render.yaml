@@ -1,3 +1,9 @@
+# Render Blueprint for the backend.
+# NOTE: a service created by hand in the Render dashboard does NOT read this
+# file; only services created or synced from the Blueprint do. That is why the
+# code's own defaults (15-min PurpleAir refresh, single-threaded model
+# predict) must be correct without any of the env vars below. Check the
+# dashboard's Environment tab when in doubt.
 services:
   - type: web
     name: shared-skies-backend
@@ -6,12 +12,26 @@ services:
     region: oregon
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    # Cheap in-memory check; reports status "degraded" (still HTTP 200) when
+    # predictions fall back to climatology, so a degraded map isn't restarted.
+    healthCheckPath: /api/health
     envVars:
       - key: PYTHON_VERSION
-        value: "3.11.9"
-      # PurpleAir READ key — powers the live same-day nbr_pm25_50km feature.
+        value: "3.12.11"
+      # PurpleAir READ key — powers the live same-day nbr_pm25_* features.
       # sync:false means Render prompts you to set the secret in the dashboard
       # (never committed to git). Without it, predictions use the static
       # climatological fallback (stable, but not live).
       - key: PURPLEAIR_API_KEY
         sync: false
+      # One statewide pull costs ~3,500 points, so 15 min is ~10M points/month.
+      - key: PURPLEAIR_CACHE_TTL_MIN
+        value: "15"
+      # Memory on the 512 MB instance: fewer glibc malloc arenas, and no
+      # per-core OpenMP/BLAS thread pools on a 0.1-CPU share.
+      - key: MALLOC_ARENA_MAX
+        value: "2"
+      - key: OMP_NUM_THREADS
+        value: "1"
+      - key: OPENBLAS_NUM_THREADS
+        value: "1"

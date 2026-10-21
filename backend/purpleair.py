@@ -80,6 +80,90 @@ def _get_api_key() -> str:
     return key
 
 
+# Status codes that will not fix themselves on retry, with what to do about them.
+_AUTH_MESSAGES = {
+    401: "PurpleAir rejected the API key (HTTP 401). Check PURPLEAIR_API_KEY "
+         "in the Render dashboard; it may have been rotated or revoked.",
+    402: "PurpleAir reports the account is out of points (HTTP 402). Live "
+         "neighbor features fall back to climatology until points are added.",
+    403: "PurpleAir refused the request (HTTP 403). The key may be a WRITE key "
+         "or lack access to /v1/sensors; a READ key is required.",
+}
+
+
+async def _fetch_live(key: str) -> tuple[list[dict], int | None, str | None]:
+    """One statewide /v1/sensors call. Returns (sensors, http_status, error)."""
+    # Billing, measured on 2026-10-20: one statewide pull returned 497 sensors
+    # and cost 3,484 points, about 7 points per sensor with these 5 fields. A
+    # 15-min refresh is therefore ~10M points/month against an organization
+    # balance that stood at 400M. last_seen and location_type are not
+    # requested because the location_type=0 and max_age params already filter
+    # outdoor + fresh sensors server-side; confidence has no server-side
+    # filter, so it stays.
+    params = {
+        "fields": "latitude,longitude,pm2.5_24hour,pm2.5_atm,confidence",
+        "location_type": 0,        # outdoor only (sole outdoor filter now)
+        "max_age": MAX_AGE_SEC,    # sole freshness filter (last_seen field dropped)
+        **TX_BBOX,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            resp = await client.get(PA_LIVE_URL, headers={"X-API-Key": key}, params=params)
+        if resp.status_code != 200:
+            msg = _AUTH_MESSAGES.get(resp.status_code)
+            if msg:
+                print(f"[purpleair] {msg}")
+            else:
+                print(f"[purpleair] HTTP {resp.status_code}: {resp.text[:200]}")
+            return [], resp.status_code, f"HTTP {resp.status_code}"
+        payload = resp.json()
+    except Exception as e:
+        print(f"[purpleair] fetch error: {type(e).__name__}: {e}")
+        return [], None, type(e).__name__
+
+    if not isinstance(payload, dict):
+        return [], 200, "unexpected response"
+    cols = payload.get("fields")
+    rows = payload.get("data")
+    if not cols or not rows:
+        return [], 200, "empty response"
+
+    idx = {name: i for i, name in enumerate(cols)}
+    needed = ("latitude", "longitude", "pm2.5_atm", "confidence")
+    if not all(n in idx for n in needed):
+        print(f"[purpleair] unexpected fields: {cols}")
+        return [], 200, "unexpected fields"
+    i24 = idx.get("pm2.5_24hour")
+
+    sensors = []
+    for row in rows:
+        try:
+            lat = row[idx["latitude"]]
+            lon = row[idx["longitude"]]
+            pm24 = row[i24] if i24 is not None else None
+            pm = pm24 if pm24 is not None else row[idx["pm2.5_atm"]]
+            conf = row[idx["confidence"]]
+        except (IndexError, KeyError, TypeError):
+            continue
+        # QC: trustworthy + valid PM. Outdoor-only and freshness are already
+        # enforced SERVER-SIDE by the location_type=0 and max_age params, so we
+        # no longer download (or bill for) last_seen / location_type to re-check.
+        if lat is None or lon is None or pm is None:
+            continue
+        # One malformed value (a string confidence, say) skips that row; it
+        # must not abort the whole billed pull.
+        try:
+            if conf is None or conf < MIN_CONFIDENCE:
+                continue
+            if not (PM25_MIN_VALID <= pm <= PM25_MAX_VALID):
+                continue
+            sensors.append({"lat": float(lat), "lon": float(lon), "pm25": float(pm)})
+        except (TypeError, ValueError):
+            continue
+
+    return sensors, 200, None
+
+
 async def fetch_live_sensors() -> list[dict]:
     """Fetch current outdoor PurpleAir readings across Texas, QC'd.
 
@@ -101,64 +185,7 @@ async def fetch_live_sensors() -> list[dict]:
     key = _get_api_key()
     if not key:
         return []
-
-    # Cost note: PurpleAir bills 1 + (sensors × fields) points per call. We drop
-    # last_seen and location_type from the field list because the location_type=0
-    # and max_age params already filter outdoor + fresh sensors SERVER-SIDE, so
-    # downloading those two fields just to re-check them client-side is wasted
-    # spend. Requesting 5 fields (+ implicit sensor_index = 6 billed) instead of
-    # 7 (+ sensor_index = 8) is a ~25% per-call cost reduction. confidence has no
-    # server-side filter param, so it stays.
-    params = {
-        "fields": "latitude,longitude,pm2.5_24hour,pm2.5_atm,confidence",
-        "location_type": 0,        # outdoor only (sole outdoor filter now)
-        "max_age": MAX_AGE_SEC,    # sole freshness filter (last_seen field dropped)
-        **TX_BBOX,
-    }
-    try:
-        async with httpx.AsyncClient(timeout=40.0) as client:
-            resp = await client.get(PA_LIVE_URL, headers={"X-API-Key": key}, params=params)
-            if resp.status_code != 200:
-                print(f"[purpleair] HTTP {resp.status_code}: {resp.text[:200]}")
-                return []
-            payload = resp.json()
-    except Exception as e:
-        print(f"[purpleair] fetch error: {e}")
-        return []
-
-    cols = payload.get("fields")
-    rows = payload.get("data")
-    if not cols or not rows:
-        return []
-
-    idx = {name: i for i, name in enumerate(cols)}
-    needed = ("latitude", "longitude", "pm2.5_atm", "confidence")
-    if not all(n in idx for n in needed):
-        print(f"[purpleair] unexpected fields: {cols}")
-        return []
-    i24 = idx.get("pm2.5_24hour")
-
-    sensors = []
-    for row in rows:
-        try:
-            lat = row[idx["latitude"]]
-            lon = row[idx["longitude"]]
-            pm24 = row[i24] if i24 is not None else None
-            pm = pm24 if pm24 is not None else row[idx["pm2.5_atm"]]
-            conf = row[idx["confidence"]]
-        except (IndexError, KeyError):
-            continue
-        # QC: trustworthy + valid PM. Outdoor-only and freshness are already
-        # enforced SERVER-SIDE by the location_type=0 and max_age params, so we
-        # no longer download (or bill for) last_seen / location_type to re-check.
-        if lat is None or lon is None or pm is None:
-            continue
-        if conf is None or conf < MIN_CONFIDENCE:
-            continue
-        if not (PM25_MIN_VALID <= pm <= PM25_MAX_VALID):
-            continue
-        sensors.append({"lat": float(lat), "lon": float(lon), "pm25": float(pm)})
-
+    sensors, _, _ = await _fetch_live(key)
     return sensors
 
 
@@ -235,8 +262,14 @@ def compute_neighbor_features(tract_lats, tract_lons, sensors):
 
 
 async def fetch_live_snapshot() -> dict:
-    """Fetch + package live sensors into a snapshot dict (cache/disk friendly)."""
-    sensors = await fetch_live_sensors()
+    """Fetch + package live sensors into a snapshot dict (cache/disk friendly).
+    http_status is None when no request was made (no key) or it failed in
+    transit; the caller uses it to choose a retry backoff."""
+    key = _get_api_key()
+    if key:
+        sensors, status, error = await _fetch_live(key)
+    else:
+        sensors, status, error = [], None, "no key"
     now = datetime.now(timezone.utc)
     pm_vals = [s["pm25"] for s in sensors]
     return {
@@ -245,4 +278,6 @@ async def fetch_live_snapshot() -> dict:
         "statewide_mean": float(np.mean(pm_vals)) if pm_vals else None,
         "fetched_at": now.isoformat(),
         "usable": len(sensors) >= MIN_LIVE_SENSORS,
+        "http_status": status,
+        "error": error,
     }

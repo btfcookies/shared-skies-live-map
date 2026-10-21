@@ -5,9 +5,11 @@ polygons over CONUS via GOES/MODIS/VIIRS imagery. Each polygon carries a
 Density attribute (Light/Medium/Heavy) that maps roughly to surface PM2.5
 loading. Free, no auth, public archive back to 2005.
 
-We fetch the most recent available day's shapefile (sometimes the current
-UTC day's file isn't published until late UTC), clip to a Texas+buffer
-bounding box, and convert to GeoJSON for the frontend overlay.
+We fetch today's UTC shapefile, or yesterday's as a flagged proxy while
+today's is not yet published, clip to a Texas+buffer bounding box, and
+convert to GeoJSON for the frontend overlay and the hms_smoke feature.
+Smoke older than yesterday is never used: training pairs each day with that
+day's own polygons.
 """
 import io
 import zipfile
@@ -119,9 +121,10 @@ def parse_hms_zip(zip_bytes: bytes, date_label: str) -> list[dict]:
     return features
 
 
-async def fetch_hms_for_date(date_obj) -> list[dict]:
-    """Try to fetch HMS for a specific UTC date. Returns features (possibly
-    empty if the file doesn't exist yet or is outside the archive)."""
+async def fetch_hms_for_date(date_obj) -> list[dict] | None:
+    """Fetch HMS for one UTC date. Returns the TX-clipped features, [] when the
+    file exists but has no polygons near Texas (a real "no smoke" day), or
+    None when the file is missing (not published yet) or could not be read."""
     year = date_obj.year
     month = date_obj.month
     yyyymmdd = date_obj.strftime("%Y%m%d")
@@ -129,39 +132,62 @@ async def fetch_hms_for_date(date_obj) -> list[dict]:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(url)
-            if resp.status_code != 200:
-                return []
-            return parse_hms_zip(resp.content, yyyymmdd)
+        if resp.status_code != 200:
+            if resp.status_code != 404:
+                print(f"[hms] HTTP {resp.status_code} for {yyyymmdd}")
+            return None
+        return parse_hms_zip(resp.content, yyyymmdd)
     except Exception as e:
         print(f"[hms] fetch error for {yyyymmdd}: {e}")
-        return []
+        return None
 
 
-async def fetch_latest_hms(max_days_back: int = 3) -> dict:
-    """Fetch the most recent available HMS polygons (clipped to TX bbox)
-    as a GeoJSON FeatureCollection. Walks back day-by-day until a non-empty
-    response is found, up to `max_days_back` days."""
-    now = datetime.now(timezone.utc)
-    for days_back in range(max_days_back + 1):
-        d = (now - timedelta(days=days_back)).date()
-        features = await fetch_hms_for_date(d)
-        if features:
-            return {
-                "type": "FeatureCollection",
-                "features": features,
-                "fetched_at": now.isoformat(),
-                "data_date": d.isoformat(),
-                "count": len(features),
-                "density_counts": _density_counts(features),
-            }
+def _feature_collection(features: list[dict], data_date, is_proxy: bool, now) -> dict:
     return {
         "type": "FeatureCollection",
-        "features": [],
+        "features": features,
         "fetched_at": now.isoformat(),
-        "data_date": None,
-        "count": 0,
-        "density_counts": {},
+        "data_date": data_date.isoformat() if data_date else None,
+        "is_proxy": is_proxy,
+        "count": len(features),
+        "density_counts": _density_counts(features),
     }
+
+
+async def fetch_latest_hms() -> dict:
+    """Today's UTC HMS polygons (clipped to the TX bbox) as a GeoJSON
+    FeatureCollection. An existing-but-empty file for today means no smoke and
+    is used as is. Only when today's file is missing does yesterday's stand in,
+    flagged is_proxy=True. Never older: a days-old plume is not today's air."""
+    now = datetime.now(timezone.utc)
+    today = now.date()
+    features = await fetch_hms_for_date(today)
+    if features is not None:
+        return _feature_collection(features, today, False, now)
+    yesterday = today - timedelta(days=1)
+    features = await fetch_hms_for_date(yesterday)
+    if features is not None:
+        return _feature_collection(features, yesterday, True, now)
+    return _feature_collection([], None, False, now)
+
+
+def hms_currency(data: dict | None, now=None) -> tuple[bool, bool]:
+    """(usable, is_proxy) for a cached HMS payload judged against the current
+    UTC date: usable only when its data_date is today or yesterday. A cache
+    fetched late yesterday ages out here even before its refresh runs."""
+    if not data or not data.get("data_date"):
+        return False, False
+    now = now or datetime.now(timezone.utc)
+    try:
+        d = datetime.fromisoformat(data["data_date"]).date()
+    except (TypeError, ValueError):
+        return False, False
+    today = now.date()
+    if d == today:
+        return True, False
+    if d == today - timedelta(days=1):
+        return True, True
+    return False, False
 
 
 def _density_counts(features: list[dict]) -> dict:
