@@ -1,7 +1,7 @@
 import { BREAKPOINTS, pm25ToGaugePct, pm25ToEpaAqi } from "../utils/aqi.js";
-import { useContext, useMemo, memo } from "react";
+import { useContext, useEffect, useMemo, useState, memo } from "react";
 import { LanguageContext } from "../App";
-import { t, translateCategory, translateHealth } from "../i18n";
+import { t, translateCategory, translateHealth, formatPercentile } from "../i18n";
 import SidebarHeader from "./SidebarHeader.jsx";
 
 function fmt(val, decimals = 1) {
@@ -9,27 +9,38 @@ function fmt(val, decimals = 1) {
   return Number(val).toFixed(decimals);
 }
 
-function fmtPct(val) {
-  if (val == null || isNaN(val)) return "—";
-  return `${Math.round(val)}th %ile`;
+const DEFAULT_REFRESH_MIN = 15;
+
+// Re-renders itself once a minute so the age stays honest between polls,
+// without re-rendering the rest of the panel.
+function UpdatedAgo({ generatedAt, lang }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
+  const ts = Date.parse(generatedAt);
+  if (Number.isNaN(ts)) return null;
+  // Clamp: a client clock running behind the server would otherwise go negative.
+  const min = Math.max(0, Math.floor((now - ts) / 60000));
+  return min < 1 ? t(lang, "updated_just_now") : t(lang, "updated_minutes_ago", min);
 }
 
-function fmtPctEs(val) {
-  if (val == null || isNaN(val)) return "—";
-  return `Pct. ${Math.round(val)}`;
-}
-
-function timeAgo(date, lang = "en") {
-  if (!date) return "";
-  const sec = Math.floor((Date.now() - date.getTime()) / 1000);
-  if (lang === "es") {
-    if (sec < 60) return "ahora";
-    if (sec < 3600) return `hace ${Math.floor(sec / 60)} min`;
-    return `hace ${Math.floor(sec / 3600)} h`;
-  }
-  if (sec < 60) return "just now";
-  if (sec < 3600) return `${Math.floor(sec / 60)}m ago`;
-  return `${Math.floor(sec / 3600)}h ago`;
+function Credits({ lang }) {
+  const credits = t(lang, "credits");
+  return (
+    <div className="footer-row footer-data">
+      {t(lang, "credits_label")}:{" "}
+      {credits.map((segments, i) => (
+        <span className="credit-item" key={i}>
+          {i > 0 && " · "}
+          {segments.map((seg, j) => (typeof seg === "string" ? seg : (
+            <a key={j} href={seg.href} target="_blank" rel="noreferrer">{seg.text}</a>
+          )))}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 const PM25Hero = memo(function PM25Hero({ pm25, epaAqi, color, category, lang }) {
@@ -122,15 +133,20 @@ const WeatherWidget = memo(function WeatherWidget({ weather, isLoading, lang }) 
   );
 });
 
+const EJ_FIELD_KEYS = [
+  "ejf_score",
+  "pct_people_of_color",
+  "pct_low_income",
+  "traffic_proximity",
+  "diesel_pm_proximity",
+  "superfund_proximity",
+];
+
 function EJContext({ tract, lang }) {
-  const ejFields = useMemo(() => ([
-    { key: "ejf_score",           label: lang === "es" ? "Puntaje EJ" : "EJ Score",          desc: lang === "es" ? "Percentil de Justicia Ambiental" : "Environmental Justice percentile" },
-    { key: "pct_people_of_color", label: lang === "es" ? "Personas de Color" : "People of Color", desc: lang === "es" ? "% de la población del tracto" : "% of census tract population" },
-    { key: "pct_low_income",      label: lang === "es" ? "Bajos ingresos" : "Low Income",        desc: lang === "es" ? "% bajo el umbral de pobreza" : "% households below poverty threshold" },
-    { key: "traffic_proximity",   label: lang === "es" ? "Tráfico" : "Traffic Proximity",        desc: lang === "es" ? "Exposición al volumen de tráfico" : "Traffic volume exposure percentile" },
-    { key: "diesel_pm_proximity", label: lang === "es" ? "PM diésel" : "Diesel PM",              desc: lang === "es" ? "Exposición a partículas diésel" : "Diesel particulate exposure percentile" },
-    { key: "superfund_proximity", label: lang === "es" ? "Superfund" : "Superfund Sites",        desc: lang === "es" ? "Cercanía a sitios Superfund" : "Proximity to EPA Superfund sites" },
-  ]), [lang]);
+  const ejFields = useMemo(() => {
+    const labels = t(lang, "ej_fields");
+    return EJ_FIELD_KEYS.map((key) => ({ key, ...labels[key] }));
+  }, [lang]);
 
   const hasAny = ejFields.some((f) => tract[f.key] != null);
   if (!hasAny) return null;
@@ -148,7 +164,7 @@ function EJContext({ tract, lang }) {
               <div className="ej-item-header">
                 <span className="ej-item-name">{label}</span>
                 <span className="ej-item-value" data-num>
-                  {lang === "es" ? fmtPctEs(val) : fmtPct(val)}
+                  {formatPercentile(lang, val)}
                 </span>
               </div>
               <div className="ej-bar-bg">
@@ -198,7 +214,7 @@ function DistributionSummary({ tracts, lang }) {
   );
 }
 
-function LoadingSkeleton() {
+function LoadingSkeleton({ lang }) {
   return (
     <div className="loading-wrap" aria-busy="true" aria-live="polite">
       <div className="sk-row">
@@ -212,7 +228,7 @@ function LoadingSkeleton() {
         <div className="skeleton sk-card" />
         <div className="skeleton sk-card" />
       </div>
-      <div className="loading-text">{/* fallback narrative */}</div>
+      <div className="loading-text">{t(lang, "loading_predictions")}</div>
     </div>
   );
 }
@@ -222,14 +238,15 @@ export default function SidePanel({
   selectedTract,
   localWeather,
   onDeselect,
-  loading,
+  refreshing = false,
   weatherLoading = false,
   error,
-  lastUpdated,
   statewide = false,
   visitCount,
 }) {
   const { lang } = useContext(LanguageContext);
+  const sources = predictions?.data_sources;
+  const refreshMin = sources?.refresh_interval_min ?? DEFAULT_REFRESH_MIN;
 
   return (
     <aside className="sidebar-content">
@@ -240,23 +257,19 @@ export default function SidePanel({
         statewide={statewide}
       />
 
-      {error && !loading && (
-        <div className="error-wrap">
-          <strong>
-            {lang === "es" ? "No se pudieron cargar las predicciones." : "Could not load predictions."}
-          </strong>
+      {/* Once data exists it stays on screen; a failed background refresh just
+          leaves the "Updated N min ago" line to age. */}
+      {error && !predictions && (
+        <div className="error-wrap" role="status">
+          <strong>{t(lang, "predictions_error_title")}</strong>
           <br />
-          {lang === "es"
-            ? "Asegúrate de que el backend esté ejecutándose en el puerto 8000."
-            : "Make sure the backend is running on port 8000."}
-          <br />
-          <code style={{ fontSize: 10, opacity: 0.7 }}>{error}</code>
+          {t(lang, "predictions_error_body")}
         </div>
       )}
 
-      {loading && !predictions && <LoadingSkeleton />}
+      {!predictions && <LoadingSkeleton lang={lang} />}
 
-      {!loading && selectedTract && (
+      {selectedTract && (
         <>
           <PM25Hero
             pm25={selectedTract.pm25}
@@ -284,7 +297,7 @@ export default function SidePanel({
         </>
       )}
 
-      {!loading && !selectedTract && predictions && (
+      {!selectedTract && predictions && (
         <div className="overview-body">
           <PM25Hero
             pm25={predictions.avg_pm25}
@@ -303,27 +316,33 @@ export default function SidePanel({
       )}
 
       <div className="sidebar-footer">
-        {/* The live-sensor fallback badge is hidden by request while the
-            PurpleAir key is restored. When using_live_neighbors is false the
-            map is serving climatological neighbor features rather than
-            same-day readings, and nothing in the UI says so -- re-enable this
-            block once the feed is back. The condition and the i18n strings are
-            left intact so restoring it is a one-line change. */}
-        {lastUpdated && (
-          <div className="footer-row">
-            <span className="last-updated">
-              {t(lang, "updated", timeAgo(lastUpdated, lang))}
-              {predictions?.data_sources?.using_live_neighbors && (
-                <> · {t(lang, "live_sensors_note", predictions.data_sources.live_purpleair_sensors)}</>
-              )}
-            </span>
+        {sources && (
+          <div
+            className={`footer-row live-badge ${sources.using_live_neighbors ? "is-live" : "is-fallback"}`}
+            role="status"
+          >
+            {sources.using_live_neighbors
+              ? <>
+                  {t(lang, "live_badge_live")}
+                  {sources.live_purpleair_sensors > 0 && (
+                    <> · {t(lang, "live_sensors_note", sources.live_purpleair_sensors.toLocaleString())}</>
+                  )}
+                </>
+              : t(lang, "live_badge_fallback")}
           </div>
         )}
-        <div className="footer-row footer-data">
-          {lang === "es"
-            ? "Datos: EPA EJScreen · Open-Meteo · Modelo de ensamblado ML"
-            : "Data: EPA EJScreen · Open-Meteo · ML ensemble model"}
-        </div>
+        {predictions?.generated_at && (
+          <div className="footer-row">
+            <span className="last-updated">
+              <UpdatedAgo generatedAt={predictions.generated_at} lang={lang} />
+              {" · "}{t(lang, "refresh_note", refreshMin)}
+            </span>
+            {refreshing && (
+              <span className="refresh-indicator" aria-live="polite">{t(lang, "refreshing")}</span>
+            )}
+          </div>
+        )}
+        <Credits lang={lang} />
         <div className="footer-row footer-built">
           {lang === "es" ? "Creado por" : "Built by"}{" "}
           <a

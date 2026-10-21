@@ -4,5 +4,18 @@
       "source": "/api/:path*",
       "destination": "https://shared-skies-backend.onrender.com/api/:path*"
     }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {
+          "key": "Content-Security-Policy",
+          "value": "frame-ancestors 'self' https://sharedskiesinitiative.org https://www.sharedskiesinitiative.org https://*.sharedskiesinitiative.org https://*.lovable.app https://*.lovableproject.com https://lovable.dev"
+        },
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" }
+      ]
+    }
   ]
 }

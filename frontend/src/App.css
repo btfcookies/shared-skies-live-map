@@ -246,25 +246,16 @@ button { font-family: inherit; }
   gap: 6px;
   font-size: 11px;
   color: var(--text-muted);
-  background: rgba(16, 185, 129, 0.06);
-  border: 1px solid rgba(16, 185, 129, 0.18);
+  background: var(--card);
+  border: 1px solid var(--glass-border-2);
   border-radius: var(--radius-pill);
-  padding: 4px 10px 4px 8px;
+  padding: 4px 10px;
   flex-shrink: 0;
   font-variant-numeric: tabular-nums;
 }
 .visit-counter-header strong {
   color: var(--text-strong);
   font-weight: 700;
-}
-.visit-counter-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--success);
-  box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55);
-  animation: livePulse 2s var(--ease) infinite;
-  will-change: transform, opacity;
 }
 @keyframes livePulse {
   0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.55); }
@@ -707,16 +698,50 @@ button { font-family: inherit; }
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.1px;
 }
-.last-updated::before {
+
+/* Live vs fallback sensor feed. The dot is static on purpose: the badge
+   reports the data source, not activity. */
+.live-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: auto;
+  font-size: 10.5px;
+  line-height: 1.35;
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+.live-badge::before {
   content: "";
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--success);
-  box-shadow: 0 0 6px var(--success);
-  animation: livePulse 2s var(--ease) infinite;
+  background: currentColor;
   flex-shrink: 0;
 }
+.live-badge.is-live {
+  color: var(--success);
+  background: rgba(16, 185, 129, 0.06);
+  border: 1px solid rgba(16, 185, 129, 0.18);
+}
+.live-badge.is-fallback {
+  color: var(--warm);
+  background: rgba(251, 191, 36, 0.08);
+  border: 1px solid rgba(251, 191, 36, 0.25);
+}
+
+.refresh-indicator {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+
+.credit-item { white-space: normal; }
 
 .weather-source-note {
   font-size: 10px;
@@ -892,16 +917,6 @@ button { font-family: inherit; }
   color: var(--text-muted);
   margin: 2px 0 8px;
   letter-spacing: 0.3px;
-}
-.fallback-badge {
-  font-size: 10.5px;
-  color: #fbbf24;
-  background: rgba(251, 191, 36, 0.08);
-  border: 1px solid rgba(251, 191, 36, 0.25);
-  border-radius: 6px;
-  padding: 5px 8px;
-  margin-bottom: 6px;
-  line-height: 1.35;
 }
 
 .disable-transitions .pm25-number,
@@ -1502,6 +1517,52 @@ button { font-family: inherit; }
   opacity: 0.75;
   word-break: break-all;
 }
+.qm-retry-btn {
+  align-self: flex-start;
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-strong);
+  background: rgba(239, 68, 68, 0.18);
+  border: 1px solid rgba(239, 68, 68, 0.40);
+  border-radius: var(--radius-sm);
+  padding: 6px 12px;
+  cursor: pointer;
+}
+.qm-retry-btn:hover { background: rgba(239, 68, 68, 0.28); }
+
+/* Solver description + objective weights, rendered from the API */
+.qm-method {
+  margin: 0 22px;
+  padding: 12px 14px;
+  border-radius: var(--radius);
+  background: var(--card);
+  border: 1px solid var(--glass-border);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.qm-method-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-strong);
+  line-height: 1.45;
+}
+.qm-method-note {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.qm-method-note.is-ok { color: var(--success); }
+.qm-method-note.is-warn { color: var(--warm); }
+.qm-method-sub {
+  margin-top: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+}
+.qm-method .qm-weights { padding: 0; }
 
 /* Sensor map tooltip */
 .sensor-tooltip {
@@ -1577,6 +1638,7 @@ button { font-family: inherit; }
   .qm-header { padding: 14px 16px 0; }
   .qm-title { font-size: 15px; }
   .qm-existing-info { margin: 0 16px; }
+  .qm-method { margin: 0 16px; }
   .qm-metrics-grid { padding: 0 16px; gap: 6px; }
   .qm-metric-card { padding: 10px 12px; }
   .qm-metric-value { font-size: 19px; }
@@ -1639,8 +1701,7 @@ button { font-family: inherit; }
 
 /* Reduced motion (already set globally in index.html, repeated for component-level) */
 @media (prefers-reduced-motion: reduce) {
-  .qm-orbit, .qm-nucleus, .visit-counter-dot, .last-updated::before,
-  .weather-loading-badge::before {
+  .qm-orbit, .qm-nucleus, .weather-loading-badge::before {
     animation: none !important;
   }
   .pm25-number, .gauge-bar-fill, .ej-bar-fill, .qm-ej-bar-fill,

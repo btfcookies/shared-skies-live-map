@@ -1,9 +1,10 @@
-import { useMemo, useRef, useEffect, useState, forwardRef, useCallback, useContext } from "react";
+import { memo, useMemo, useRef, useEffect, useState, forwardRef, useCallback, useContext } from "react";
 import { MapContainer, TileLayer, GeoJSON, useMap, Circle, CircleMarker, Tooltip, Pane } from "react-leaflet";
 import L from "leaflet";
 import { BREAKPOINTS, pm25ToEpaAqi } from "../utils/aqi.js";
 import { LanguageContext } from '../App';
 import { t, translateCategory } from '../i18n';
+import "./MapView.css";
 
 // Basemap: Stadia Maps "Alidade Smooth Dark" -- the near-black successor to
 // CARTO Dark Matter. CARTO began watermarking this site's tiles once traffic
@@ -15,10 +16,27 @@ import { t, translateCategory } from '../i18n';
 // head-of-line queueing that made the single-host Esri fallback lag.
 // This is a single combined layer (base + labels); Stadia does not split
 // alidade into label-free and labels-only raster variants the way CARTO did.
-const BASEMAP_URL =
-  "https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}{r}.png";
-const ATTRIBUTION =
-  '&copy; <a href="https://stadiamaps.com/">Stadia Maps</a> &copy; <a href="https://openmaptiles.org/">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+//
+// Fallback: Stadia answers 401 on origins that are not registered (every
+// Vercel preview URL) and 429 when rate-limited, which leaves a black map.
+// After a streak of tile errors with no successful tile in between we switch,
+// once, to keyless Esri Dark Gray. It is slower and label-free, but readable.
+const BASEMAPS = {
+  stadia: {
+    url: "https://tiles.stadiamaps.com/tiles/alidade_smooth_dark/{z}/{x}/{y}{r}.png",
+    attribution:
+      '&copy; <a href="https://stadiamaps.com/">Stadia Maps</a> &copy; <a href="https://openmaptiles.org/">OpenMapTiles</a> &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxNativeZoom: 20,
+  },
+  esri: {
+    url: "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
+    attribution:
+      'Powered by <a href="https://www.esri.com/">Esri</a> &mdash; Esri, HERE, Garmin, &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, and the GIS user community',
+    // Dark Gray Base has real imagery only to z16; Leaflet upscales beyond.
+    maxNativeZoom: 16,
+  },
+};
+const TILE_ERROR_STREAK_FALLBACK = 6;
 
 const TEXAS_CENTER = [31.5, -99.0];
 const TEXAS_ZOOM = 6;
@@ -33,12 +51,67 @@ const HMS_STYLE = {
   Heavy:   { fillColor: "#cc3300", color: "#80190f", fillOpacity: 0.55, weight: 1.4 },
   Unknown: { fillColor: "#888888", color: "#555555", fillOpacity: 0.30, weight: 1 },
 };
+const hmsStyle = (feat) => HMS_STYLE[feat?.properties?.density || "Unknown"] || HMS_STYLE.Unknown;
 // Refresh HMS once an hour to match the cache TTL.
 const HMS_REFRESH_MS = 60 * 60 * 1000;
+
+// Stable pathOptions objects: react-leaflet calls setStyle whenever the
+// pathOptions identity changes, so inline literals restyle every marker on
+// every render.
+const SEARCH_MARKER_STYLE = { color: "#fff", weight: 2, fillColor: "#0077b6", fillOpacity: 1 };
+const EXISTING_SENSOR_STYLE = {
+  color: "rgba(255,255,255,0.3)",
+  weight: 1,
+  fillColor: "rgba(255,255,255,0.25)",
+  fillOpacity: 0.7,
+};
+const QUANTUM_SENSOR_STYLE = {
+  color: "#ffffff", weight: 2, fillColor: "#38bdf8", fillOpacity: 0.96, className: "ssi-sensor",
+};
+const QUANTUM_TOP3_STYLE = {
+  color: "#ffffff", weight: 2.5, fillColor: "#fbbf24", fillOpacity: 0.96, className: "ssi-sensor-top",
+};
 
 function normGeoid(val) {
   if (!val) return "";
   return String(val).padStart(11, "0");
+}
+
+// Resting choropleth style for one tract.
+function tractStyle(pred, isSelected) {
+  return {
+    fillColor: pred ? pred.color : "#2d3436",
+    // 0.70 (was 0.80): Stadia alidade ships a single combined base+labels
+    // raster with no labels-only variant to draw on top, so the choropleth
+    // buries Texas city names. Easing the resting fill lets the base labels
+    // read through the light Good/Moderate tracts without muddying the color.
+    fillOpacity: isSelected ? 0.95 : 0.70,
+    color: isSelected ? "#ffffff" : (pred ? pred.color : "rgba(0,0,0,0.08)"),
+    weight: isSelected ? 2.5 : 1.0,
+    lineCap: "round",
+    lineJoin: "round",
+  };
+}
+
+function hoverStyle(isSelected) {
+  return {
+    fillOpacity: 0.92,
+    weight: isSelected ? 2.5 : 1.8,
+    color: isSelected ? "#ffffff" : "rgba(255,255,255,0.8)",
+  };
+}
+
+// Keeps the legend and its toggle from acting as map clicks/scrolls: they are
+// rendered inside the map container, so without this a tap on them reaches
+// BackgroundClickHandler and clears the selected tract.
+function isolateFromMap(el) {
+  if (!el) return;
+  L.DomEvent.disableClickPropagation(el);
+  L.DomEvent.disableScrollPropagation(el);
+}
+
+function todayUtcIso() {
+  return new Date().toISOString().slice(0, 10);
 }
 
 function FlyToHandler({ target }) {
@@ -166,8 +239,92 @@ function MapLifecycle() {
   return null;
 }
 
+// Fires on every map move frame: re-projects last hover lat/lng → new container px
+// so the tooltip follows the map during drag, and re-applies hover outline style
+// so canvas redraws during pan don't wipe the highlight. Module scope (refs as
+// props) so parent re-renders don't remount it and re-bind the listener.
+function MapMoveHandler({ tooltipDomRef, lastMouseLatLngRef, hoveredLayerRef, hoveredGeoidRef, selectedGeoidRef }) {
+  const map = useMap();
+  useEffect(() => {
+    const onMove = () => {
+      // --- tooltip: re-project geographic point to current screen position ---
+      const el = tooltipDomRef.current;
+      const latLng = lastMouseLatLngRef.current;
+      if (el && latLng) {
+        const pt = map.latLngToContainerPoint(latLng);
+        const mapSize = map.getSize();
+        const ttW = el.offsetWidth || 180;
+        const ttH = el.offsetHeight || 110;
+        const flipX = pt.x + ttW + 20 > mapSize.x;
+        const flipY = pt.y + ttH + 20 > mapSize.y;
+        el.style.left = `${pt.x + (flipX ? -(ttW + 10) : 14)}px`;
+        el.style.top  = `${pt.y + (flipY ? -(ttH + 10) : -10)}px`;
+      }
+      // --- hover outline: re-apply after canvas redraw ---
+      const layer = hoveredLayerRef.current;
+      const hGeoid = hoveredGeoidRef.current;
+      if (layer && hGeoid) {
+        try {
+          layer.setStyle(hoverStyle(hGeoid === selectedGeoidRef.current));
+          layer.bringToFront();
+        } catch (_) {}
+      }
+    };
+    map.on("move", onMove);
+    return () => map.off("move", onMove);
+  }, [map, tooltipDomRef, lastMouseLatLngRef, hoveredLayerRef, hoveredGeoidRef, selectedGeoidRef]);
+  return null;
+}
+
+// One recommended-sensor dot. Memoized with a stable center/eventHandlers so a
+// parent re-render doesn't call setLatLng/setStyle or re-bind clicks on it.
+const QuantumSensorMarker = memo(function QuantumSensorMarker({ sensor, renderer, lang, onSelect }) {
+  const isTop3 = (sensor.placement_rank ?? 99) <= 3;
+  const center = useMemo(() => [sensor.lat, sensor.lon], [sensor.lat, sensor.lon]);
+  const eventHandlers = useMemo(() => ({ click: () => onSelect(sensor.geoid) }), [onSelect, sensor.geoid]);
+  return (
+    <CircleMarker
+      center={center}
+      radius={isTop3 ? 8 : 7}
+      // renderer must be a top-level option: Leaflet picks a path's renderer
+      // when it is added, so a renderer inside pathOptions (applied later via
+      // setStyle) is ignored and the dot lands on the pane's default canvas.
+      renderer={renderer}
+      pathOptions={isTop3 ? QUANTUM_TOP3_STYLE : QUANTUM_SENSOR_STYLE}
+      eventHandlers={eventHandlers}
+    >
+      <Tooltip
+        direction="top"
+        offset={[0, -10]}
+        opacity={0.95}
+        className="sensor-tooltip"
+      >
+        <span style={{ fontWeight: 700 }}>#{sensor.placement_rank}</span>
+        {" "}{t(lang, "quantum.recommended_sensor")}
+        <br />
+        <span style={{ fontSize: 10, opacity: 0.7 }}>
+          <span title={t(lang, "quantum.ej_abbr_title")}>{t(lang, "quantum.ej_abbr")}</span>
+          : {((sensor.ej_priority || 0) * 100).toFixed(0)}%
+          {" | "}
+          <span title={t(lang, "quantum.cov_abbr_title")}>{t(lang, "quantum.cov_abbr")}</span>
+          : {((sensor.coverage_need || 0) * 100).toFixed(0)}%
+        </span>
+      </Tooltip>
+    </CircleMarker>
+  );
+});
+
+const GEOJSON_STATUS_KEYS = {
+  loading: "map_loading_tracts",
+  retrying: "map_waking_server",
+  error: "map_tracts_error",
+};
+// Shapes loaded but predictions still pending: after this long it is most
+// likely a cold start waiting on the first compute, so say so.
+const PREDICTIONS_SLOW_MS = 6000;
+
 const MapViewContent = forwardRef(
-  ({ geojson, predictions, onTractSelect, onBackgroundClick, selectedGeoid, searchMarker, sensorMarkers, existingSensors, activeTab = "map" }, _ref) => {
+  ({ geojson, geojsonStatus, predictions, onTractSelect, onBackgroundClick, selectedGeoid, searchMarker, sensorMarkers, existingSensors, activeTab = "map" }, _ref) => {
     const { lang } = useContext(LanguageContext);
     const langRef = useRef(lang);
     useEffect(() => { langRef.current = lang; }, [lang]);
@@ -179,6 +336,12 @@ const MapViewContent = forwardRef(
     const hoveredLayerRef = useRef(null);
     const hoveredGeoidRef = useRef(null);
     const lastMouseLatLngRef = useRef(null);
+    // The choropleth L.GeoJSON, plus a geoid -> polygon index over it so a
+    // selection change can restyle two polygons instead of all 6,896.
+    const choroplethRef = useRef(null);
+    const layerIndexRef = useRef({ owner: null, byGeoid: null });
+    // Geoid whose polygon currently carries the selected style.
+    const styledSelectionRef = useRef(null);
     // Polygon hover/preview/click is only enabled on the Map tab. We use a ref
     // so the long-lived layer.on() handlers always read the *current* tab
     // (their useCallback has empty deps to keep handler identity stable).
@@ -192,9 +355,10 @@ const MapViewContent = forwardRef(
     const [hmsData, setHmsData] = useState(null);
     const [showHmsSmoke] = useState(false);
 
-    // Fetch the HMS smoke layer once on mount and refresh every hour. Survives
-    // when toggled off because the cached feature collection is cheap to keep.
+    // Fetch the HMS smoke layer only while the overlay is on, refreshing every
+    // hour; while it is off nothing would render it, so skip the request.
     useEffect(() => {
+      if (!showHmsSmoke) return;
       let alive = true;
       const fetchHms = async () => {
         try {
@@ -210,11 +374,32 @@ const MapViewContent = forwardRef(
       fetchHms();
       const id = setInterval(fetchHms, HMS_REFRESH_MS);
       return () => { alive = false; clearInterval(id); };
-    }, []);
+    }, [showHmsSmoke]);
 
     useEffect(() => { onTractSelectRef.current = onTractSelect; }, [onTractSelect]);
-    useEffect(() => { selectedGeoidRef.current = selectedGeoid; }, [selectedGeoid]);
     useEffect(() => { activeTabRef.current = activeTab; }, [activeTab]);
+
+    const getTractLayer = useCallback((geoid) => {
+      const gj = choroplethRef.current;
+      if (!gj || !geoid) return null;
+      let idx = layerIndexRef.current;
+      if (idx.owner !== gj) {
+        const byGeoid = new Map();
+        gj.eachLayer((l) => byGeoid.set(normGeoid(l.feature?.properties?.GEOID), l));
+        idx = layerIndexRef.current = { owner: gj, byGeoid };
+      }
+      return idx.byGeoid.get(geoid) ?? null;
+    }, []);
+
+    const bringSelectedToFront = useCallback((exceptLayer) => {
+      // Neighbours drawn later on the canvas otherwise clip the selected
+      // polygon's white border (most visible on the Sensors tab, where hover
+      // bringToFront is gated off).
+      const layer = getTractLayer(selectedGeoidRef.current);
+      if (layer && layer !== exceptLayer) {
+        try { layer.bringToFront(); } catch (_) {}
+      }
+    }, [getTractLayer]);
 
     // When the user leaves the Map tab, kill any in-flight hover state so it
     // doesn't visually persist (mouseout won't fire because the cursor isn't
@@ -225,15 +410,8 @@ const MapViewContent = forwardRef(
       const layer = hoveredLayerRef.current;
       const geoid = hoveredGeoidRef.current;
       if (layer && geoid) {
-        const isSelected = geoid === selectedGeoidRef.current;
-        const pred = predMapRef.current[geoid];
         try {
-          layer.setStyle({
-            fillColor: pred ? pred.color : "#2d3436",
-            fillOpacity: isSelected ? 0.95 : 0.70,
-            color: isSelected ? "#ffffff" : (pred ? pred.color : "rgba(0,0,0,0.08)"),
-            weight: isSelected ? 2.5 : 1.0,
-          });
+          layer.setStyle(tractStyle(predMapRef.current[geoid], geoid === selectedGeoidRef.current));
         } catch (_) {}
       }
       hoveredLayerRef.current = null;
@@ -267,23 +445,14 @@ const MapViewContent = forwardRef(
 
     useEffect(() => { predMapRef.current = predMap; }, [predMap]);
 
+    // Depends on predictions only. react-leaflet's GeoJSON re-applies `style`
+    // to every polygon whenever this function's identity changes, so keeping
+    // selectedGeoid out of the deps keeps a click from restyling all 6,896
+    // tracts; the selection effect below restyles just the two that changed.
     const styleFeature = useCallback((feature) => {
       const geoid = normGeoid(feature.properties?.GEOID);
-      const pred = predMap[geoid];
-      const isSelected = geoid === selectedGeoid;
-      return {
-        fillColor: pred ? pred.color : "#2d3436",
-        // 0.70 (was 0.80): Stadia alidade ships a single combined base+labels
-        // raster with no labels-only variant to draw on top, so the choropleth
-        // buries Texas city names. Easing the resting fill lets the base labels
-        // read through the light Good/Moderate tracts without muddying the color.
-        fillOpacity: isSelected ? 0.95 : 0.70,
-        color: isSelected ? "#ffffff" : (pred ? pred.color : "rgba(0,0,0,0.08)"),
-        weight: isSelected ? 2.5 : 1.0,
-        lineCap: "round",
-        lineJoin: "round",
-      };
-    }, [predMap, selectedGeoid]);
+      return tractStyle(predMap[geoid], geoid === selectedGeoidRef.current);
+    }, [predMap]);
 
     // onEachFeature runs once per feature — uses refs to always access latest state.
     // Tooltip is a custom React overlay (not Leaflet bindTooltip) so it never glitches.
@@ -300,6 +469,10 @@ const MapViewContent = forwardRef(
           // selection-mutating side effects either).
           if (activeTabRef.current !== "map") return;
           justClickedRef.current = true;
+          // bubblingMouseEvents=false means no map click follows this one, so
+          // the flag would otherwise linger and swallow the next real
+          // background click (the first "click away to deselect" did nothing).
+          setTimeout(() => { justClickedRef.current = false; }, 0);
           onTractSelectRef.current?.(geoid);
         },
 
@@ -309,18 +482,16 @@ const MapViewContent = forwardRef(
           hoveredGeoidRef.current = geoid;
           lastMouseLatLngRef.current = e.latlng;
           const pred = predMapRef.current[geoid];
-          const isSelected = geoid === selectedGeoidRef.current;
-          e.target.setStyle({
-            fillOpacity: 0.92,
-            weight: isSelected ? 2.5 : 1.8,
-            color: isSelected ? "#ffffff" : "rgba(255,255,255,0.8)",
-          });
+          e.target.setStyle(hoverStyle(geoid === selectedGeoidRef.current));
           e.target.bringToFront();
 
           if (!pred) return;
           const currentLang = langRef.current;
           const rawName = feature.properties?.NAME ?? geoid;
-          const displayName = rawName.startsWith(t(currentLang, 'census_tract_prefix')) ? rawName : `${t(currentLang, 'census_tract_prefix')} ${rawName}`;
+          // NAME is the English "Census Tract NNNN"; strip it so ES doesn't
+          // get "Tracto censal Census Tract NNNN".
+          const tractNum = String(rawName).replace(/^Census Tract\s*/i, "");
+          const displayName = `${t(currentLang, 'census_tract_prefix')} ${tractNum}`;
           const county = pred.county ? pred.county.replace(/ County$/i, "") : "";
           const pt = e.containerPoint;
           setTooltipData({ name: displayName, pm25: pred.pm25, epaAqi: pred.epa_aqi ?? pm25ToEpaAqi(pred.pm25), color: pred.color, category: pred.category, county, x: pt.x, y: pt.y });
@@ -348,18 +519,14 @@ const MapViewContent = forwardRef(
           hoveredLayerRef.current = null;
           hoveredGeoidRef.current = null;
           lastMouseLatLngRef.current = null;
-          const currentPred = predMapRef.current[geoid];
-          const isSelected = geoid === selectedGeoidRef.current;
-          e.target.setStyle({
-            fillColor: currentPred ? currentPred.color : "#2d3436",
-            fillOpacity: isSelected ? 0.95 : 0.70,
-            color: isSelected ? "#ffffff" : (currentPred ? currentPred.color : "rgba(0,0,0,0.08)"),
-            weight: isSelected ? 2.5 : 1.0,
-          });
+          e.target.setStyle(tractStyle(predMapRef.current[geoid], geoid === selectedGeoidRef.current));
+          // The hovered polygon was raised above the selected one; put the
+          // selected border back on top.
+          bringSelectedToFront(e.target);
           setTooltipData(null);
         },
       });
-    }, []); // empty deps — all state accessed via refs
+    }, [bringSelectedToFront]); // stable — all state accessed via refs
 
     // Only render GeoJSON once BOTH geojson and predictions are ready,
     // so onEachFeature always has a populated predMapRef.
@@ -368,102 +535,92 @@ const MapViewContent = forwardRef(
       geojson.features[0]?.geometry &&
       predictions.length > 0;
 
-    function StyleUpdater() {
-      const map = useMap();
-      useEffect(() => {
-        if (!map) return;
-        let raf = null;
-        const applyStyles = () => {
-          map.eachLayer((layer) => {
-            if (layer?.feature && typeof layer.setStyle === "function") {
-              try { layer.setStyle(styleFeature(layer.feature)); } catch (_) {}
-            }
-          });
-          // Bring the SELECTED polygon to the front so its full white border
-          // renders cleanly above neighbour polygons. Without this, neighbours
-          // that happen to be drawn later in the canvas can clip the border
-          // and leave the visible "gap" the user sees when a sensor is
-          // clicked on the Sensors tab (where mouseover.bringToFront() is
-          // gated off).
-          const sg = selectedGeoidRef.current;
-          if (sg) {
-            map.eachLayer((layer) => {
-              if (
-                layer?.feature &&
-                normGeoid(layer.feature.properties?.GEOID) === sg &&
-                typeof layer.bringToFront === "function"
-              ) {
-                try { layer.bringToFront(); } catch (_) {}
-              }
-            });
-          }
-          // After resetting all layers, re-apply hover style so it is never wiped.
-          // (StyleUpdater re-mounts on every render because it's defined inside the
-          // render function — its useEffect always fires, which would otherwise clear
-          // any style set by mouseover.)
-          const layer = hoveredLayerRef.current;
-          const hGeoid = hoveredGeoidRef.current;
-          if (layer && hGeoid) {
-            const isSelected = hGeoid === selectedGeoidRef.current;
-            try {
-              layer.setStyle({
-                fillOpacity: 0.92,
-                weight: isSelected ? 2.5 : 1.8,
-                color: isSelected ? "#ffffff" : "rgba(255,255,255,0.8)",
-              });
-              layer.bringToFront();
-            } catch (_) {}
-          }
-        };
-        raf = requestAnimationFrame(applyStyles);
-        return () => { if (raf) cancelAnimationFrame(raf); };
-      }, [predMap, selectedGeoid, map]);
-      return null;
-    }
+    // Selection restyle. Runs after the GeoJSON child's own update effect, so
+    // when predictions changed in the same commit the all-polygon restyle has
+    // already happened and this only corrects the old/new selected tracts and
+    // re-applies the hover highlight that restyle wiped. Touches only the
+    // choropleth (never HMS smoke or marker layers).
+    useEffect(() => {
+      selectedGeoidRef.current = selectedGeoid;
+      if (!hasPolygons) {
+        styledSelectionRef.current = null;
+        return;
+      }
+      const prevGeoid = styledSelectionRef.current;
+      const restyle = (geoid) => {
+        const layer = getTractLayer(geoid);
+        if (!layer) return;
+        try { layer.setStyle(tractStyle(predMap[geoid], geoid === selectedGeoid)); } catch (_) {}
+      };
+      if (prevGeoid && prevGeoid !== selectedGeoid) restyle(prevGeoid);
+      if (selectedGeoid) restyle(selectedGeoid);
+      styledSelectionRef.current = selectedGeoid || null;
+      bringSelectedToFront(null);
 
-    // Fires on every map move frame: re-projects last hover lat/lng → new container px
-    // so the tooltip follows the map during drag, and re-applies hover outline style
-    // so canvas redraws during pan don't wipe the highlight.
-    function MapMoveHandler() {
-      const map = useMap();
-      useEffect(() => {
-        const onMove = () => {
-          // --- tooltip: re-project geographic point to current screen position ---
-          const el = tooltipDomRef.current;
-          const latLng = lastMouseLatLngRef.current;
-          if (el && latLng) {
-            const pt = map.latLngToContainerPoint(latLng);
-            const mapSize = map.getSize();
-            const ttW = el.offsetWidth || 180;
-            const ttH = el.offsetHeight || 110;
-            const flipX = pt.x + ttW + 20 > mapSize.x;
-            const flipY = pt.y + ttH + 20 > mapSize.y;
-            el.style.left = `${pt.x + (flipX ? -(ttW + 10) : 14)}px`;
-            el.style.top  = `${pt.y + (flipY ? -(ttH + 10) : -10)}px`;
-          }
-          // --- hover outline: re-apply after canvas redraw ---
-          const layer = hoveredLayerRef.current;
-          const hGeoid = hoveredGeoidRef.current;
-          if (layer && hGeoid) {
-            const isSelected = hGeoid === selectedGeoidRef.current;
-            try {
-              layer.setStyle({
-                fillOpacity: 0.92,
-                weight: isSelected ? 2.5 : 1.8,
-                color: isSelected ? "#ffffff" : "rgba(255,255,255,0.8)",
-              });
-              layer.bringToFront();
-            } catch (_) {}
-          }
-        };
-        map.on("move", onMove);
-        return () => map.off("move", onMove);
-      }, [map]);
-      return null;
-    }
+      const hovered = hoveredLayerRef.current;
+      const hGeoid = hoveredGeoidRef.current;
+      if (hovered && hGeoid) {
+        try {
+          hovered.setStyle(hoverStyle(hGeoid === selectedGeoid));
+          hovered.bringToFront();
+        } catch (_) {}
+      }
+    }, [selectedGeoid, predMap, hasPolygons, getTractLayer, bringSelectedToFront]);
 
-    const onTileLoadStart = useCallback(() => {}, []);
-    const onTileLoadEnd = useCallback(() => {}, []);
+    // Basemap fallback: count consecutive tile errors; any successful tile
+    // resets the streak. Offline errors are ignored, Esri would fail too.
+    const [basemap, setBasemap] = useState("stadia");
+    const tileErrorStreakRef = useRef(0);
+    const tileEventHandlers = useMemo(() => ({
+      tileload: () => { tileErrorStreakRef.current = 0; },
+      tileerror: () => {
+        if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+        tileErrorStreakRef.current += 1;
+        // These handlers are only attached to the Stadia layer, so this fires once.
+        if (tileErrorStreakRef.current === TILE_ERROR_STREAK_FALLBACK) {
+          console.warn("Basemap tiles failing; switching to Esri Dark Gray");
+          setBasemap("esri");
+        }
+      },
+    }), []);
+    const tiles = BASEMAPS[basemap];
+
+    const handleSensorSelect = useCallback((geoid) => {
+      justClickedRef.current = true;
+      onTractSelectRef.current?.(geoid);
+    }, []);
+
+    const searchCenter = useMemo(
+      () => (searchMarker ? [searchMarker.lat, searchMarker.lon] : null),
+      [searchMarker?.lat, searchMarker?.lon]
+    );
+
+    // existing_sensors entries may lack sensor_id, so key on position too.
+    const existingSensorItems = useMemo(
+      () => (existingSensors || []).map((s, i) => ({
+        key: `existing-${s.sensor_id ?? `${s.lat},${s.lon}`}-${i}`,
+        center: [s.lat, s.lon],
+      })),
+      [existingSensors]
+    );
+
+    // Flag yesterday's proxy file, and anything not dated today even if the
+    // backend did not flag it.
+    const hmsIsStale = Boolean(hmsData?.data_date) &&
+      (hmsData.is_proxy === true || hmsData.data_date !== todayUtcIso());
+
+    // The shapes alone can't be drawn (hasPolygons needs predictions too), so
+    // keep an overlay up until predictions arrive instead of a bare basemap.
+    const predictionsPending = geojsonStatus === "ready" && predictions.length === 0;
+    const [predictionsSlow, setPredictionsSlow] = useState(false);
+    useEffect(() => {
+      if (!predictionsPending) { setPredictionsSlow(false); return; }
+      const id = setTimeout(() => setPredictionsSlow(true), PREDICTIONS_SLOW_MS);
+      return () => clearTimeout(id);
+    }, [predictionsPending]);
+    const statusKey = predictionsPending
+      ? (predictionsSlow ? "map_waking_server" : "map_loading_tracts")
+      : GEOJSON_STATUS_KEYS[geojsonStatus];
 
     return (
       <div style={{ position: "relative", height: "100%", width: "100%" }}>
@@ -491,8 +648,9 @@ const MapViewContent = forwardRef(
           maxBoundsViscosity={0.6}
         >
           <TileLayer
-            url={BASEMAP_URL}
-            attribution={ATTRIBUTION}
+            key={basemap}
+            url={tiles.url}
+            attribution={tiles.attribution}
             zIndex={1}
             keepBuffer={8}
             updateWhenZooming={true}
@@ -500,19 +658,25 @@ const MapViewContent = forwardRef(
             updateInterval={150}
             crossOrigin="anonymous"
             noWrap={true}
-            maxNativeZoom={20}
-            eventHandlers={{ tileloadstart: onTileLoadStart, tileload: onTileLoadEnd, tileerror: onTileLoadEnd }}
+            maxNativeZoom={tiles.maxNativeZoom}
+            eventHandlers={basemap === "stadia" ? tileEventHandlers : undefined}
           />
 
           <FlyToHandler target={searchMarker} />
           <AdaptiveWheelZoom />
           <MapLifecycle />
           <BackgroundClickHandler onBackgroundClick={onBackgroundClick} justClickedRef={justClickedRef} />
-          <StyleUpdater />
-          <MapMoveHandler />
+          <MapMoveHandler
+            tooltipDomRef={tooltipDomRef}
+            lastMouseLatLngRef={lastMouseLatLngRef}
+            hoveredLayerRef={hoveredLayerRef}
+            hoveredGeoidRef={hoveredGeoidRef}
+            selectedGeoidRef={selectedGeoidRef}
+          />
 
           {hasPolygons && (
             <GeoJSON
+              ref={choroplethRef}
               data={geojson}
               style={styleFeature}
               onEachFeature={onEachFeature}
@@ -527,37 +691,29 @@ const MapViewContent = forwardRef(
               <GeoJSON
                 key={`hms-${hmsData.data_date}-${hmsData.count}`}
                 data={hmsData}
-                style={(feat) => {
-                  const d = feat?.properties?.density || "Unknown";
-                  return HMS_STYLE[d] || HMS_STYLE.Unknown;
-                }}
+                style={hmsStyle}
               />
             </Pane>
           )}
 
-          {searchMarker && (
+          {searchCenter && (
             <Circle
-              center={[searchMarker.lat, searchMarker.lon]}
+              center={searchCenter}
               radius={120}
               interactive={false}
               bubblingMouseEvents={false}
               className="search-marker-circle"
-              pathOptions={{ color: "#fff", weight: 2, fillColor: "#0077b6", fillOpacity: 1 }}
+              pathOptions={SEARCH_MARKER_STYLE}
             />
           )}
 
           {/* Existing PurpleAir sensors (grey dots) */}
-          {existingSensors && existingSensors.map((s) => (
+          {existingSensorItems.map((s) => (
             <CircleMarker
-              key={`existing-${s.sensor_id}`}
-              center={[s.lat, s.lon]}
+              key={s.key}
+              center={s.center}
               radius={4}
-              pathOptions={{
-                color: "rgba(255,255,255,0.3)",
-                weight: 1,
-                fillColor: "rgba(255,255,255,0.25)",
-                fillOpacity: 0.7,
-              }}
+              pathOptions={EXISTING_SENSOR_STYLE}
               interactive={false}
               bubblingMouseEvents={false}
             />
@@ -570,55 +726,23 @@ const MapViewContent = forwardRef(
               through; only the SVG paths (with their default
               pointer-events:visiblePainted) capture clicks on the actual dots. */}
           <Pane name="quantumSensorsPane" style={{ zIndex: 600, pointerEvents: "none" }}>
-            {sensorMarkers && sensorMarkers.map((s) => {
-              const isTop3 = (s.placement_rank ?? 99) <= 3;
-              return (
-                <CircleMarker
-                  key={`sensor-${s.geoid}`}
-                  center={[s.lat, s.lon]}
-                  radius={isTop3 ? 8 : 7}
-                  pathOptions={{
-                    renderer: sensorSvgRenderer,
-                    color: "#ffffff",
-                    weight: isTop3 ? 2.5 : 2,
-                    fillColor: isTop3 ? "#fbbf24" : "#38bdf8",
-                    fillOpacity: 0.96,
-                    className: isTop3 ? "ssi-sensor-top" : "ssi-sensor",
-                  }}
-                  eventHandlers={{
-                    click: () => {
-                      justClickedRef.current = true;
-                      onTractSelectRef.current?.(s.geoid);
-                    },
-                  }}
-                >
-                  <Tooltip
-                    direction="top"
-                    offset={[0, -10]}
-                    opacity={0.95}
-                    className="sensor-tooltip"
-                  >
-                    <span style={{ fontWeight: 700 }}>#{s.placement_rank}</span>
-                    {" "}{lang === "es" ? "Sensor Recomendado" : "Recommended Sensor"}
-                    <br />
-                    <span style={{ fontSize: 10, opacity: 0.7 }}>
-                      EJ: {((s.ej_priority || 0) * 100).toFixed(0)}%
-                      {" | "}
-                      {lang === "es" ? "Cob" : "Cov"}: {((s.coverage_need || 0) * 100).toFixed(0)}%
-                    </span>
-                  </Tooltip>
-                </CircleMarker>
-              );
-            })}
+            {sensorMarkers && sensorMarkers.map((s) => (
+              <QuantumSensorMarker
+                key={`sensor-${s.geoid}`}
+                sensor={s}
+                renderer={sensorSvgRenderer}
+                lang={lang}
+                onSelect={handleSensorSelect}
+              />
+            ))}
           </Pane>
 
 
           <button
+            ref={isolateFromMap}
             type="button"
             className="mobile-legend-toggle"
-            aria-label={legendExpanded
-              ? (lang === 'es' ? 'Cerrar leyenda' : 'Close legend')
-              : (lang === 'es' ? 'Abrir leyenda' : 'Open legend')}
+            aria-label={t(lang, 'legend_toggle_aria')}
             aria-expanded={legendExpanded}
             onClick={() => setLegendExpanded(v => !v)}
           >
@@ -635,8 +759,9 @@ const MapViewContent = forwardRef(
               </svg>
             )}
           </button>
-          <div className={`map-legend${legendExpanded ? ' expanded' : ''}`}>
-            <div className="legend-title">PM2.5 µg/m³</div>
+          <div ref={isolateFromMap} className={`map-legend${legendExpanded ? ' expanded' : ''}`}>
+            {/* The title is uppercased; keep the unit as-is or µg reads as "MG". */}
+            <div className="legend-title">PM2.5 <span style={{ textTransform: "none" }}>µg/m³</span></div>
             {BREAKPOINTS.map((b) => (
               <div className="legend-row" key={b.category}>
                 <div className="legend-swatch" style={{ background: b.color }} />
@@ -644,8 +769,25 @@ const MapViewContent = forwardRef(
                 <span className="legend-range">{b.label}</span>
               </div>
             ))}
+            {/* Smoke is dated so an older analysis is never read as today's. */}
+            {showHmsSmoke && hmsData?.data_date && (
+              <div className="legend-hms-date">
+                {lang === "es" ? "Humo NOAA HMS: " : "NOAA HMS smoke: "}{hmsData.data_date}
+                {hmsIsStale && (lang === "es" ? " (el más reciente, no es de hoy)" : " (latest available, not today's)")}
+              </div>
+            )}
           </div>
         </MapContainer>
+
+        {/* Always mounted so screen readers pick up the status change. */}
+        <div className="map-status-overlay" role="status" aria-live="polite">
+          {statusKey && (
+            <div className={`map-status-card${geojsonStatus === "error" ? " is-error" : ""}`}>
+              <span className="map-status-spinner" aria-hidden="true" />
+              <span>{t(lang, statusKey)}</span>
+            </div>
+          )}
+        </div>
 
         {/* Custom tooltip — positioned absolutely over the map, never glitches */}
         {tooltipData && (
@@ -673,4 +815,6 @@ const MapViewContent = forwardRef(
 
 MapViewContent.displayName = "MapViewContent";
 
-export default forwardRef((props, ref) => <MapViewContent {...props} ref={ref} />);
+// memo: App re-renders (search input, weather, panel state) leave the map's
+// props unchanged, so they no longer re-render the whole Leaflet tree.
+export default memo(forwardRef((props, ref) => <MapViewContent {...props} ref={ref} />));

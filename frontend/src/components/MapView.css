@@ -1,0 +1,68 @@
+/* MapView-only styles. This file loads before App.css, so selectors that
+   override App.css rules are scoped under .leaflet-container to win. */
+
+/* The legend takes its own clicks and scrolls (MapView isolates it from
+   Leaflet), so a tap on it neither selects the tract underneath nor clears
+   the current selection. */
+.leaflet-container .map-legend {
+  pointer-events: auto;
+  cursor: default;
+}
+
+.legend-hms-date {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  line-height: 1.4;
+  color: var(--text-dim);
+}
+
+/* Tract-map status (loading / waking the server / error). Centered over the
+   map and click-through, so the basemap stays usable while tracts load. */
+.map-status-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1150;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 16px;
+  pointer-events: none;
+}
+.map-status-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 340px;
+  padding: 11px 16px;
+  background: var(--glass-strong);
+  border: 1px solid var(--glass-border-2);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-2);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.4;
+}
+.map-status-card.is-error { border-color: rgba(239, 68, 68, 0.45); }
+.map-status-spinner {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-soft);
+  border-top-color: var(--accent);
+  animation: mapStatusSpin 0.9s linear infinite;
+}
+.map-status-card.is-error .map-status-spinner {
+  border-color: rgba(239, 68, 68, 0.2);
+  border-top-color: var(--danger);
+}
+@keyframes mapStatusSpin { to { transform: rotate(360deg); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .map-status-spinner { animation: none; }
+}

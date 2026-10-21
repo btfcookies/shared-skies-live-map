@@ -4,6 +4,28 @@ import { LanguageContext } from "../App";
 import { t } from "../i18n";
 
 const API_BASE = import.meta.env.VITE_API_URL || "";
+// Matches the backend contract: q is capped at 100 chars (422 beyond that).
+const MAX_QUERY_LEN = 100;
+const MIN_SUGGEST_LEN = 3;
+const SUGGEST_DEBOUNCE_MS = 350;
+
+// mode=suggest is Photon only; mode=submit may also fall back to Nominatim,
+// which has a strict usage policy, so it is reserved for explicit searches.
+// Returns [] for any non-2xx (429 rate limit, 422, 5xx) so callers can treat
+// it as "no results" without special cases.
+async function fetchGeocode(query, mode, lang, signal) {
+  const res = await fetch(
+    `${API_BASE}/api/geocode?q=${encodeURIComponent(query)}&mode=${mode}`,
+    { headers: { "Accept-Language": lang === "es" ? "es" : "en" }, signal }
+  );
+  if (!res.ok) {
+    const err = new Error(`Geocode error ${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  const results = await res.json();
+  return Array.isArray(results) ? results : [];
+}
 
 const PinIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -34,7 +56,7 @@ const AlertIcon = () => (
   </svg>
 );
 
-export default function SearchBar({ onSearch, loading }) {
+export default function SearchBar({ onSearch, predictionsReady = true }) {
   const { lang } = useContext(LanguageContext);
   const [searchInput, setSearchInput] = useState("");
   const [searchType, setSearchType] = useState("address");
@@ -42,19 +64,38 @@ export default function SearchBar({ onSearch, loading }) {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [suggestLoading, setSuggestLoading] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
+  // Set when suggestions are unavailable (rate limit / server error), so the
+  // dropdown doesn't claim "address not found".
+  const [suggestUnavailable, setSuggestUnavailable] = useState(false);
+  // The query the current suggestions belong to. Enter only reuses them, and
+  // the dropdown only says "not found", when they match what is typed.
+  const [suggestionsFor, setSuggestionsFor] = useState("");
   const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
   const [isSearching, setIsSearching] = useState(false);
   const searchRef = useRef(null);
+  const inputRef = useRef(null);
   const timeoutRef = useRef(null);
+  // Picking a suggestion writes its name into the input; that write must not
+  // start a new lookup and reopen the dropdown.
+  const skipNextQueryRef = useRef(false);
 
   const abortControllerRef = useRef(null);
 
   // Debounced typo-tolerant suggestions (backend proxies Photon w/ Texas bias;
   // no need to append ", Texas" — the server scopes results to the TX bbox).
   useEffect(() => {
-    if (searchType !== "address" || !searchInput.trim() || searchInput.trim().length < 2) {
-      setSuggestions([]);
+    const query = searchInput.trim();
+    if (skipNextQueryRef.current) {
+      skipNextQueryRef.current = false;
       setSuggestLoading(false);
+      return;
+    }
+    if (searchType !== "address" || query.length < MIN_SUGGEST_LEN) {
+      setSuggestions([]);
+      setSuggestionsFor("");
+      setSuggestLoading(false);
+      setSuggestUnavailable(false);
       setActiveIndex(-1);
       return;
     }
@@ -65,31 +106,41 @@ export default function SearchBar({ onSearch, loading }) {
       abortControllerRef.current = new AbortController();
 
       try {
-        const response = await fetch(
-          `${API_BASE}/api/geocode?q=${encodeURIComponent(searchInput.trim())}`,
-          {
-            headers: { "Accept-Language": lang === "es" ? "es" : "en" },
-            signal: abortControllerRef.current.signal
-          }
-        );
-        const results = await response.json();
-        setSuggestions(Array.isArray(results) ? results : []);
+        const results = await fetchGeocode(query, "suggest", lang, abortControllerRef.current.signal);
+        setSuggestions(results);
+        setSuggestionsFor(query);
+        setSuggestUnavailable(false);
         setActiveIndex(-1);
-        setShowSuggestions(true);
+        // Only open if the user is still in the box (e.g. not after a
+        // language switch re-ran this effect).
+        if (document.activeElement === inputRef.current) setShowSuggestions(true);
         setSuggestLoading(false);
       } catch (err) {
         if (err.name !== 'AbortError') {
-          console.error("Autocomplete error:", err);
+          if (!err.status) console.error("Autocomplete error:", err);
           setSuggestions([]);
+          setSuggestionsFor("");
+          setSuggestUnavailable(true);
           setSuggestLoading(false);
         }
       }
-    }, 250);
+    }, SUGGEST_DEBOUNCE_MS);
     return () => {
       clearTimeout(timeoutRef.current);
       if (abortControllerRef.current) abortControllerRef.current.abort();
     };
   }, [searchInput, searchType, lang]);
+
+  // The "still loading" note is moot once predictions arrive and App selects
+  // the pending location.
+  useEffect(() => {
+    if (predictionsReady) setInfo("");
+  }, [predictionsReady]);
+
+  const runSearch = (coords) => {
+    const status = onSearch(coords);
+    setInfo(status === "pending" ? t(lang, "search.pending") : "");
+  };
 
   // Click-outside
   useEffect(() => {
@@ -111,8 +162,7 @@ export default function SearchBar({ onSearch, loading }) {
         setIsSearching(false);
         return;
       }
-      onSearch({ lat, lon, address });
-      setSuggestions([]);
+      runSearch({ lat, lon, address });
       setShowSuggestions(false);
     } catch (err) {
       setError(t(lang, "search.errors.search_failed"));
@@ -123,7 +173,15 @@ export default function SearchBar({ onSearch, loading }) {
   };
 
   const handleSuggestionClick = (suggestion) => {
-    setSearchInput(suggestion.name || suggestion.display_name.split(",")[0]);
+    const label = suggestion.name || suggestion.display_name.split(",")[0];
+    clearTimeout(timeoutRef.current);
+    if (abortControllerRef.current) abortControllerRef.current.abort();
+    setSuggestLoading(false);
+    if (label !== searchInput) skipNextQueryRef.current = true;
+    setSearchInput(label);
+    setSuggestions([]);
+    setSuggestionsFor("");
+    setActiveIndex(-1);
     geocodeAddress(suggestion.display_name, parseFloat(suggestion.lat), parseFloat(suggestion.lon));
   };
 
@@ -151,26 +209,28 @@ export default function SearchBar({ onSearch, loading }) {
     setError("");
 
     if (searchType === "address") {
-      if (!searchInput.trim()) {
+      const query = searchInput.trim();
+      if (!query) {
         setError(t(lang, "search.errors.enter_address"));
         return;
       }
-      if (activeIndex >= 0 && activeIndex < suggestions.length) {
+      const fresh = suggestions.length > 0 && suggestionsFor === query;
+      if (fresh && activeIndex >= 0 && activeIndex < suggestions.length) {
         handleSuggestionClick(suggestions[activeIndex]);
-      } else if (suggestions.length > 0) {
+      } else if (fresh) {
         handleSuggestionClick(suggestions[0]);
       } else {
-        // No suggestions yet (e.g. instant Enter) — one direct query through
-        // OUR backend proxy. (The old code called nominatim.org straight from
-        // the browser, which their policy blocks — it silently failed.)
+        // No suggestions for this exact text (instant Enter, or Photon found
+        // nothing): one explicit submit query, which may use the Nominatim
+        // fallback server-side.
+        clearTimeout(timeoutRef.current);
+        if (abortControllerRef.current) abortControllerRef.current.abort();
+        setSuggestLoading(false);
+        setShowSuggestions(false);
         setIsSearching(true);
         try {
-          const response = await fetch(
-            `${API_BASE}/api/geocode?q=${encodeURIComponent(searchInput.trim())}`,
-            { headers: { "Accept-Language": lang === "es" ? "es" : "en" } }
-          );
-          const results = await response.json();
-          if (Array.isArray(results) && results.length > 0) {
+          const results = await fetchGeocode(query, "submit", lang);
+          if (results.length > 0) {
             const r = results[0];
             geocodeAddress(r.display_name, parseFloat(r.lat), parseFloat(r.lon));
           } else {
@@ -198,7 +258,7 @@ export default function SearchBar({ onSearch, loading }) {
         setError(t(lang, "search.errors.coords_out_of_bounds"));
         return;
       }
-      onSearch({ lat, lon });
+      runSearch({ lat, lon });
       setError("");
     }
   };
@@ -212,7 +272,7 @@ export default function SearchBar({ onSearch, loading }) {
             role="tab"
             aria-selected={searchType === "address"}
             className={`search-tab ${searchType === "address" ? "active" : ""}`}
-            onClick={() => { setSearchType("address"); setSearchInput(""); setSuggestions([]); setError(""); }}
+            onClick={() => { setSearchType("address"); setSearchInput(""); setSuggestions([]); setError(""); setInfo(""); }}
           >
             <PinIcon />
             <span>{t(lang, "search.address_tab")}</span>
@@ -222,7 +282,7 @@ export default function SearchBar({ onSearch, loading }) {
             role="tab"
             aria-selected={searchType === "coordinates"}
             className={`search-tab ${searchType === "coordinates" ? "active" : ""}`}
-            onClick={() => { setSearchType("coordinates"); setSearchInput(""); setSuggestions([]); setError(""); }}
+            onClick={() => { setSearchType("coordinates"); setSearchInput(""); setSuggestions([]); setError(""); setInfo(""); }}
           >
             <CompassIcon />
             <span>{t(lang, "search.coordinates_tab")}</span>
@@ -233,12 +293,14 @@ export default function SearchBar({ onSearch, loading }) {
           <div className="search-input-wrapper">
             <SearchIcon />
             <input
+              ref={inputRef}
               type="text"
+              maxLength={MAX_QUERY_LEN}
               placeholder={searchType === "address"
                 ? t(lang, "search.placeholder_address")
                 : t(lang, "search.placeholder_coords")}
               value={searchInput}
-              onChange={(e) => setSearchInput(e.target.value)}
+              onChange={(e) => { setSearchInput(e.target.value); setInfo(""); }}
               onFocus={() => searchType === "address" && setShowSuggestions(true)}
               onKeyDown={handleInputKeyDown}
               required
@@ -249,7 +311,8 @@ export default function SearchBar({ onSearch, loading }) {
             />
 
             {searchType === "address" && showSuggestions &&
-              (suggestions.length > 0 || suggestLoading || searchInput.trim().length >= 2) && (
+              (suggestions.length > 0 || suggestLoading ||
+                (!suggestUnavailable && suggestionsFor === searchInput.trim())) && (
               <div className="suggestions-dropdown" role="listbox">
                 {suggestions.map((s, idx) => (
                   <div
@@ -277,15 +340,20 @@ export default function SearchBar({ onSearch, loading }) {
             )}
           </div>
 
-          <button type="submit" disabled={loading || isSearching}>
-            {isSearching ? t(lang, "search.searching") : loading ? t(lang, "search.loading") : t(lang, "search.search_button")}
+          <button type="submit" disabled={isSearching}>
+            {isSearching ? t(lang, "search.searching") : t(lang, "search.search_button")}
           </button>
         </div>
 
         {error && (
-          <div className="search-error">
+          <div className="search-error" role="alert">
             <AlertIcon />
             <span>{error}</span>
+          </div>
+        )}
+        {!error && info && (
+          <div className="search-info" role="status">
+            <span>{info}</span>
           </div>
         )}
       </form>

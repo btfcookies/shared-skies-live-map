@@ -50,9 +50,8 @@ export default function SidebarHeader({ selectedTract, visitCount, onDeselect, s
           <span className="brand-name">Shared Skies Initiative</span>
         </div>
         {visitCount != null && (
-          <div className="visit-counter-header" title={lang === "es" ? "Usuarios" : "Live users"}>
-            <span className="visit-counter-dot" aria-hidden="true" />
-            <span><strong data-num>{visitCount.toLocaleString()}</strong> {lang === "es" ? "usuarios" : "users"}</span>
+          <div className="visit-counter-header" title={t(lang, "visits_tooltip")}>
+            <span data-num>{t(lang, "visits_label", visitCount.toLocaleString())}</span>
           </div>
         )}
       </div>
@@ -63,7 +62,7 @@ export default function SidebarHeader({ selectedTract, visitCount, onDeselect, s
       </div>
 
       <div className="lang-toggle-wrap">
-        <div className="lang-toggle" role="tablist" aria-label="Language selector">
+        <div className="lang-toggle" role="group" aria-label={t(lang, "lang_selector_aria")}>
           <button
             className={`lang-btn ${lang === "en" ? "active" : ""}`}
             onClick={() => toggleLang("en")}

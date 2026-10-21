@@ -1,7 +1,39 @@
-import { useContext, memo } from "react";
+import { useContext, useEffect, useState, memo } from "react";
 import { LanguageContext } from "../App";
 import { t } from "../i18n";
 import SidebarHeader from "./SidebarHeader.jsx";
+
+// Only used if an older backend omits methods.quantum_annealing.weights;
+// mirrors W_COVERAGE/W_ERROR/W_EJ/W_PM25 in backend/quantum/qubo_solver.py.
+const DEFAULT_WEIGHTS = { coverage: 0.30, error: 0.20, ej: 0.30, pm25: 0.20 };
+const WEIGHT_KEYS = ["coverage", "error", "ej", "pm25"];
+const DEFAULT_TOTAL_TRACTS = 6896;
+const DEFAULT_NUM_SENSORS = 25;
+const SLOW_NOTICE_MS = 8000;
+
+const SUPERSCRIPT_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹";
+
+// "5.7 × 10⁷⁰" for n-choose-k, summed in log space so it never overflows.
+function formatCombinations(n, k) {
+  if (!(n >= k && k > 0)) return null;
+  let lg = 0;
+  for (let i = 1; i <= k; i++) lg += Math.log10((n - k + i) / i);
+  let exp = Math.floor(lg);
+  let mantissa = Math.pow(10, lg - exp);
+  if (mantissa.toFixed(1) === "10.0") { mantissa = 1; exp += 1; }
+  const sup = String(exp).split("").map((d) => SUPERSCRIPT_DIGITS[d]).join("");
+  return `${mantissa.toFixed(1)} × 10${sup}`;
+}
+
+// Weights as whole-number percentages of their sum, so the copy and the bars
+// stay right even if the solver's weights don't add up to exactly 1.
+function weightPercents(weights) {
+  const w = weights && WEIGHT_KEYS.every((k) => typeof weights[k] === "number")
+    ? weights
+    : DEFAULT_WEIGHTS;
+  const total = WEIGHT_KEYS.reduce((sum, k) => sum + w[k], 0) || 1;
+  return Object.fromEntries(WEIGHT_KEYS.map((k) => [k, Math.round((w[k] / total) * 100)]));
+}
 
 const MetricCard = memo(function MetricCard({ label, value, sub, accent }) {
   return (
@@ -24,9 +56,11 @@ function EJQuartileBar({ label, data }) {
         <div className="qm-ej-bar-fill" style={{ width: `${data.pct}%` }} />
       </div>
       <span className="qm-ej-bar-pct" data-num>{data.pct}%</span>
-      <span className="qm-ej-bar-detail" data-num>
-        {data.covered}/{data.total}
-      </span>
+      {data.total != null && (
+        <span className="qm-ej-bar-detail" data-num>
+          {data.covered}/{data.total}
+        </span>
+      )}
     </div>
   );
 }
@@ -35,12 +69,21 @@ export default function SensorPlacement({
   quantumData,
   loading,
   error,
+  onRetry,
   onViewSensor,
   selectedTract,
   onDeselect,
   visitCount,
 }) {
   const { lang } = useContext(LanguageContext);
+  // The first solve after a cold start is slow; say so instead of spinning
+  // silently.
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (!loading) { setSlow(false); return; }
+    const id = setTimeout(() => setSlow(true), SLOW_NOTICE_MS);
+    return () => clearTimeout(id);
+  }, [loading]);
 
   const sharedHeader = (
     <SidebarHeader
@@ -66,6 +109,7 @@ export default function SensorPlacement({
           </div>
           <div className="qm-loading-text">{t(lang, "quantum.loading")}</div>
           <div className="qm-loading-detail">{t(lang, "quantum.loading_detail")}</div>
+          {slow && <div className="qm-loading-detail">{t(lang, "quantum.loading_slow")}</div>}
         </div>
       </>
     );
@@ -78,17 +122,32 @@ export default function SensorPlacement({
         <div className="qm-error">
           <strong>{t(lang, "quantum.error")}</strong>
           <code>{error}</code>
+          {onRetry && (
+            <button type="button" className="qm-retry-btn" onClick={onRetry}>
+              {t(lang, "quantum.retry")}
+            </button>
+          )}
         </div>
       </>
     );
   }
 
-  if (!quantumData?.methods) return sharedHeader;
+  const quantum = quantumData?.methods?.quantum_annealing;
+  if (!quantum) return sharedHeader;
 
-  const quantum = quantumData.methods.quantum_annealing;
-  const quantumCov = quantum.coverage;
-  const quantumTracts = quantum.selected_tracts;
+  const quantumCov = quantum.coverage || {};
+  const quantumTracts = quantum.selected_tracts || [];
   const ejQuartiles = quantumCov.coverage_by_ej_quartile || {};
+  // Top-level num_sensors is the requested k; the method's num_sensors is how
+  // many well-spaced sites the solver could actually place.
+  const numSensors = quantumData.num_sensors ?? DEFAULT_NUM_SENSORS;
+  const numPlaced = quantum.num_sensors ?? quantumTracts.length;
+  const totalTracts = quantumData.num_total_tracts ?? DEFAULT_TOTAL_TRACTS;
+  const numCandidates = quantum.num_candidates;
+  const weights = weightPercents(quantum.weights);
+  // The solver's method_display is English-only, so other languages get the
+  // localized label.
+  const methodDisplay = (lang === "en" && quantum.method_display) || t(lang, "quantum.quantum_annealing");
 
   return (
     <div className="qm-container">
@@ -103,21 +162,17 @@ export default function SensorPlacement({
         <div className="qm-existing-info">
           <span className="qm-existing-dot" />
           <span data-num>
-            {lang === "es"
-              ? `${quantumData.num_existing_sensors} sensores PurpleAir existentes`
-              : `${quantumData.num_existing_sensors} existing PurpleAir sensors`}
+            {t(lang, "quantum.existing_sensors", quantumData.num_existing_sensors.toLocaleString())}
           </span>
-          <span className="qm-existing-hint">
-            {lang === "es" ? "puntos grises en el mapa" : "grey dots on the map"}
-          </span>
+          <span className="qm-existing-hint">{t(lang, "quantum.existing_hint")}</span>
         </div>
       )}
 
       <div className="qm-metrics-grid">
         <MetricCard
           label={t(lang, "quantum.num_sensors")}
-          value={quantumData.num_sensors}
-          sub={lang === "es" ? "nuevos a colocar" : "new placements"}
+          value={numPlaced}
+          sub={t(lang, "quantum.new_placements")}
           accent="#38bdf8"
         />
         <MetricCard
@@ -125,7 +180,7 @@ export default function SensorPlacement({
           value={`${quantumCov.pct_covered}%`}
           sub={
             quantumCov.new_covered != null
-              ? `+${quantumCov.new_covered} ${lang === "es" ? "nuevos" : "new"}`
+              ? `+${quantumCov.new_covered} ${t(lang, "quantum.new_suffix")}`
               : `${quantumCov.covered_count}/${quantumCov.total_tracts}`
           }
           accent="#10b981"
@@ -142,6 +197,31 @@ export default function SensorPlacement({
         />
       </div>
 
+      <div className="section-header">{t(lang, "quantum.method")}</div>
+      <div className="qm-method">
+        <div className="qm-method-name">{methodDisplay}</div>
+        {numCandidates > 0 && (
+          <div className="qm-method-note" data-num>{t(lang, "quantum.candidate_pool", numCandidates)}</div>
+        )}
+        {typeof quantum.feasible === "boolean" && (
+          <div className={`qm-method-note ${quantum.feasible ? "is-ok" : "is-warn"}`}>
+            {quantum.feasible
+              ? t(lang, "quantum.feasible_yes", numSensors)
+              : t(lang, "quantum.feasible_no", numPlaced, numSensors)}
+          </div>
+        )}
+        <div className="qm-method-sub">{t(lang, "quantum.weights")}</div>
+        <div className="qm-ej-bars qm-weights">
+          {WEIGHT_KEYS.map((k) => (
+            <EJQuartileBar
+              key={k}
+              label={t(lang, `quantum.weight_names.${k}`)}
+              data={{ pct: weights[k] }}
+            />
+          ))}
+        </div>
+      </div>
+
       <div className="section-header">{t(lang, "quantum.coverage_by_ej")}</div>
       <div className="qm-ej-bars">
         <EJQuartileBar label={t(lang, "quantum.q1_low")}  data={ejQuartiles["Q1 (Low EJ)"]} />
@@ -152,7 +232,7 @@ export default function SensorPlacement({
 
       <div className="section-header">{t(lang, "quantum.recommended_locations")}</div>
       <div className="qm-sensor-list">
-        {quantumTracts.slice(0, 25).map((s) => {
+        {quantumTracts.slice(0, numSensors).map((s) => {
           const county = s.county ? s.county.replace(/ County$/i, "") : "";
           return (
             <div
@@ -162,7 +242,7 @@ export default function SensorPlacement({
               role="button"
               tabIndex={0}
               onKeyDown={(e) => e.key === "Enter" && onViewSensor?.(s)}
-              aria-label={`${lang === "es" ? "Ver tracto" : "View tract"} ${s.geoid?.slice(-6)} ${county}`}
+              aria-label={t(lang, "quantum.view_tract", s.geoid?.slice(-6), county)}
             >
               <div className="qm-sensor-rank" data-num>#{s.placement_rank}</div>
               <div className="qm-sensor-info">
@@ -173,7 +253,9 @@ export default function SensorPlacement({
               </div>
               <div className="qm-sensor-scores">
                 <div className="qm-sensor-score-row">
-                  <span className="qm-score-label">EJ</span>
+                  <span className="qm-score-label" title={t(lang, "quantum.ej_abbr_title")}>
+                    {t(lang, "quantum.ej_abbr")}
+                  </span>
                   <div className="qm-score-bar-bg">
                     <div
                       className="qm-score-bar-fill ej"
@@ -182,7 +264,9 @@ export default function SensorPlacement({
                   </div>
                 </div>
                 <div className="qm-sensor-score-row">
-                  <span className="qm-score-label">{lang === "es" ? "Cob" : "Cov"}</span>
+                  <span className="qm-score-label" title={t(lang, "quantum.cov_abbr_title")}>
+                    {t(lang, "quantum.cov_abbr")}
+                  </span>
                   <div className="qm-score-bar-bg">
                     <div
                       className="qm-score-bar-fill cov"
@@ -192,7 +276,7 @@ export default function SensorPlacement({
                 </div>
               </div>
               <div className="qm-sensor-composite" data-num>
-                {(s.composite_score * 100).toFixed(0)}
+                {((s.composite_score || 0) * 100).toFixed(0)}
               </div>
             </div>
           );
@@ -202,17 +286,29 @@ export default function SensorPlacement({
       <div style={{ padding: "0 22px", display: "flex", flexDirection: "column", gap: 12 }}>
         <div className="guide-explainer">
           <h4>{t(lang, "quantum.tab_intro_title")}</h4>
-          {t(lang, "quantum.tab_intro_body")}
+          {t(lang, "quantum.tab_intro_body", {
+            k: numSensors,
+            n: totalTracts.toLocaleString("en-US"),
+            existing: quantumData.num_existing_sensors > 0
+              ? quantumData.num_existing_sensors.toLocaleString("en-US")
+              : null,
+          })}
         </div>
 
         <div className="guide-explainer">
           <h4>{t(lang, "quantum.what_is")}</h4>
-          {t(lang, "quantum.what_is_body")}
+          {t(lang, "quantum.what_is_body", {
+            k: numSensors,
+            n: totalTracts.toLocaleString("en-US"),
+            total: formatCombinations(totalTracts, numSensors),
+            candidates: numCandidates > numSensors ? numCandidates.toLocaleString("en-US") : null,
+            candidateTotal: formatCombinations(numCandidates, numSensors),
+          })}
         </div>
 
         <div className="guide-explainer">
           <h4>{t(lang, "quantum.why_ej")}</h4>
-          {t(lang, "quantum.why_ej_body")}
+          {t(lang, "quantum.why_ej_body", weights)}
         </div>
       </div>
     </div>
