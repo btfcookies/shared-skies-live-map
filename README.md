@@ -140,6 +140,14 @@ python -m pytest
 
 The suite is offline: it needs no PurpleAir key and mocks every outbound call. CI (`.github/workflows/ci.yml`) runs it on Python 3.11 and 3.12 and builds the frontend.
 
+The frontend has its own unit tests (Vitest, in `frontend/src/**/*.test.js`), currently covering the AQI helpers in `utils/aqi.js`:
+
+```
+cd frontend && npm ci && npm test
+```
+
+CI runs them before the frontend build.
+
 Some tests pin values that are expected to change when the model or its inputs change on purpose. A retrain, or a new `models/sensor_recent_pm.json` or `models/training_sensors.json`, moves them; a dependency bump should not. Regenerate them from the new files rather than loosening the tolerances:
 
 - `GOLDEN_MEAN` and `GOLDEN_TRACTS` in `tests/test_model.py` (climatology-fallback predictions, checked to 1e-6; the comment there says how to recompute them);
