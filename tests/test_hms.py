@@ -10,7 +10,8 @@ import httpx
 import shapefile
 
 import backend.main as main
-from backend import hms
+from backend.state import EPOCH
+from backend import config, hms, hms_feed
 
 NOAA_HOST = "satepsanone.nesdis.noaa.gov"
 
@@ -111,30 +112,30 @@ def test_refresh_keeps_current_day_when_noaa_has_nothing(monkeypatch, no_snapsho
     current = {"type": "FeatureCollection", "features": [], "data_date": today,
                "is_proxy": False, "count": 0, "fetched_at": datetime.now(timezone.utc).isoformat()}
     far = datetime.now(timezone.utc) + timedelta(days=1)
-    monkeypatch.setattr(main, "_hms_cache", {"data": current, "expires": far})
+    monkeypatch.setattr(hms_feed, "hms_cache", {"data": current, "expires": far})
 
     async def nothing():
         return {"type": "FeatureCollection", "features": [], "data_date": None,
                 "is_proxy": False, "count": 0}
 
     monkeypatch.setattr(hms, "fetch_latest_hms", nothing)
-    asyncio.run(main._fetch_hms())
-    assert main._hms_cache["data"] is current
+    asyncio.run(hms_feed._fetch_hms())
+    assert hms_feed.hms_cache["data"] is current
 
 
 def test_hydrate_ignores_stale_hms_snapshot(monkeypatch, tmp_path):
     # Only the HMS snapshot exists; every other path points at nothing.
     for attr in ("TEXAS_SNAPSHOT_PATH", "QUANTUM_SNAPSHOT_PATH", "PURPLEAIR_SNAPSHOT_PATH",
                  "WEATHER_GRID_SNAPSHOT_PATH", "AQ_SNAPSHOT_PATH", "CONDITIONS_SNAPSHOT_PATH"):
-        monkeypatch.setattr(main, attr, str(tmp_path / f"{attr}.json"))
+        monkeypatch.setattr(config, attr, str(tmp_path / f"{attr}.json"))
     path = tmp_path / "hms.json"
-    monkeypatch.setattr(main, "HMS_SNAPSHOT_PATH", str(path))
+    monkeypatch.setattr(config, "HMS_SNAPSHOT_PATH", str(path))
     fetched = datetime.now(timezone.utc).isoformat()
 
     for data_date, loaded in (("2026-06-19", False),
                               ((_today() - timedelta(days=1)).isoformat(), True)):
         path.write_text(json.dumps({"type": "FeatureCollection", "features": [], "count": 0,
                                     "data_date": data_date, "fetched_at": fetched}))
-        monkeypatch.setattr(main, "_hms_cache", {"data": None, "expires": main._EPOCH})
+        monkeypatch.setattr(hms_feed, "hms_cache", {"data": None, "expires": EPOCH})
         main._hydrate_from_snapshots()
-        assert (main._hms_cache["data"] is not None) is loaded, data_date
+        assert (hms_feed.hms_cache["data"] is not None) is loaded, data_date

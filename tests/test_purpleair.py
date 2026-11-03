@@ -6,8 +6,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import pytest
 
-import backend.main as main
-from backend import purpleair as pa
+from backend.state import EPOCH
+from backend import config, purpleair as pa, purpleair_feed
 
 PA_HOST = "api.purpleair.com"
 DUMMY_KEY = "test-key-not-real"
@@ -66,8 +66,8 @@ def _snap(usable, fetched_at=None, n=30):
 
 
 def test_refresh_backoff_and_recovery(monkeypatch, no_snapshots):
-    monkeypatch.setattr(main, "_purpleair_cache",
-                        {"data": None, "next_attempt": main._EPOCH, "failures": 0})
+    monkeypatch.setattr(purpleair_feed, "purpleair_cache",
+                        {"data": None, "next_attempt": EPOCH, "failures": 0})
 
     async def failing():
         return _snap(False)
@@ -76,35 +76,35 @@ def test_refresh_backoff_and_recovery(monkeypatch, no_snapshots):
         return _snap(True)
 
     def scheduled_in_min():
-        delta = main._purpleair_cache["next_attempt"] - datetime.now(timezone.utc)
+        delta = purpleair_feed.purpleair_cache["next_attempt"] - datetime.now(timezone.utc)
         return round(delta.total_seconds() / 60)
 
     monkeypatch.setattr(pa, "fetch_live_snapshot", failing)
     gaps = []
     for _ in range(4):
-        assert asyncio.run(main._fetch_purpleair()) is False
+        assert asyncio.run(purpleair_feed._fetch_purpleair()) is False
         gaps.append(scheduled_in_min())
     assert gaps == [5, 10, 15, 15]
 
     monkeypatch.setattr(pa, "fetch_live_snapshot", working)
-    assert asyncio.run(main._fetch_purpleair()) is True
-    assert main._purpleair_cache["failures"] == 0
-    assert scheduled_in_min() == main.PURPLEAIR_CACHE_TTL_MIN == 15
+    assert asyncio.run(purpleair_feed._fetch_purpleair()) is True
+    assert purpleair_feed.purpleair_cache["failures"] == 0
+    assert scheduled_in_min() == config.PURPLEAIR_CACHE_TTL_MIN == 15
 
     # A later failure keeps the good snapshot.
     monkeypatch.setattr(pa, "fetch_live_snapshot", failing)
-    asyncio.run(main._fetch_purpleair())
-    assert main._purpleair_cache["data"]["usable"] is True
+    asyncio.run(purpleair_feed._fetch_purpleair())
+    assert purpleair_feed.purpleair_cache["data"]["usable"] is True
 
 
 def test_live_data_age_limit(monkeypatch):
     now = datetime.now(timezone.utc)
-    fresh = _snap(True, now - timedelta(minutes=main.PURPLEAIR_MAX_AGE_MIN - 1))
-    stale = _snap(True, now - timedelta(minutes=main.PURPLEAIR_MAX_AGE_MIN + 1))
-    monkeypatch.setattr(main, "_purpleair_cache", {"data": fresh, "next_attempt": now, "failures": 0})
-    assert main._live_purpleair(now) is fresh
-    monkeypatch.setattr(main, "_purpleair_cache", {"data": stale, "next_attempt": now, "failures": 0})
-    assert main._live_purpleair(now) is None
-    monkeypatch.setattr(main, "_purpleair_cache",
+    fresh = _snap(True, now - timedelta(minutes=config.PURPLEAIR_MAX_AGE_MIN - 1))
+    stale = _snap(True, now - timedelta(minutes=config.PURPLEAIR_MAX_AGE_MIN + 1))
+    monkeypatch.setattr(purpleair_feed, "purpleair_cache", {"data": fresh, "next_attempt": now, "failures": 0})
+    assert purpleair_feed.live_purpleair(now) is fresh
+    monkeypatch.setattr(purpleair_feed, "purpleair_cache", {"data": stale, "next_attempt": now, "failures": 0})
+    assert purpleair_feed.live_purpleair(now) is None
+    monkeypatch.setattr(purpleair_feed, "purpleair_cache",
                         {"data": _snap(False), "next_attempt": now, "failures": 0})
-    assert main._live_purpleair(now) is None
+    assert purpleair_feed.live_purpleair(now) is None

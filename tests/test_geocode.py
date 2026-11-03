@@ -5,7 +5,7 @@ import itertools
 import httpx
 import pytest
 
-import backend.main as main
+from backend import geocode, limits
 from backend.ratelimit import FixedWindowLimiter
 
 PHOTON = "photon.komoot.io"
@@ -35,10 +35,10 @@ NOMINATIM_HIT = [{"display_name": "Old Town Spring, Spring, Texas, USA",
 @pytest.fixture
 def geo(net, monkeypatch):
     """Fresh cache, limiter and Nominatim throttle; a client IP per test."""
-    monkeypatch.setattr(main, "_geocode_cache", type(main._geocode_cache)())
-    lim = main._geocode_limiter
-    monkeypatch.setattr(main, "_geocode_limiter", FixedWindowLimiter(lim.limit, lim.window_s))
-    monkeypatch.setattr(main, "_nominatim_state", {"last": 0.0, "lock": None})
+    monkeypatch.setattr(geocode, "_geocode_cache", type(geocode._geocode_cache)())
+    lim = limits.geocode_limiter
+    monkeypatch.setattr(limits, "geocode_limiter", FixedWindowLimiter(lim.limit, lim.window_s))
+    monkeypatch.setattr(geocode, "_nominatim_state", {"last": 0.0, "lock": None})
     net.route(PHOTON, _photon({
         "houston": _photon_feature("Houston", 29.76, -95.37),
         "shreveport": _photon_feature("Shreveport", 32.5, -93.75, state="Louisiana"),
@@ -98,7 +98,7 @@ def test_nominatim_is_throttled(client, geo):
     assert len(net.calls(NOMINATIM)) == 1
     assert second.status_code == 502
     # A skipped fallback is not cached as "no such place".
-    main._nominatim_state["last"] = 0.0
+    geocode._nominatim_state["last"] = 0.0
     third = client.get("/api/geocode", params={"q": "nowhere two", "mode": "submit"},
                        headers=headers)
     assert third.status_code == 200 and third.json()
@@ -118,7 +118,7 @@ def test_query_length_and_mode_validation(client, geo):
 
 def test_per_ip_rate_limit(client, geo):
     net, headers = geo
-    assert (main._geocode_limiter.limit, main._geocode_limiter.window_s) == (60, 60.0)
+    assert (limits.geocode_limiter.limit, limits.geocode_limiter.window_s) == (60, 60.0)
     codes = [client.get("/api/geocode", params={"q": "houston"}, headers=headers).status_code
              for _ in range(60)]
     assert codes == [200] * 60

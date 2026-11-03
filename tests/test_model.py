@@ -6,13 +6,13 @@ from datetime import datetime, timezone
 import numpy as np
 import pytest
 
-import backend.main as main
+from backend import config, model, weather_feed
 
-# The app fixture swaps main._load_bundle for the session's cached bundle;
+# The app fixture swaps model.load_bundle for the session's cached bundle;
 # keep the real loader, captured at collection time, for the failure test.
-_real_load_bundle = main._load_bundle
+_real_load_bundle = model.load_bundle
 
-FEATURE_NAMES_PATH = os.path.join(main.MODELS_DIR, "feature_names.json")
+FEATURE_NAMES_PATH = os.path.join(config.MODELS_DIR, "feature_names.json")
 N_TRACTS = 6896
 
 # 2026-10-21 UTC, the evening of Oct 20 in Texas.
@@ -54,15 +54,15 @@ def test_bundle_blend(bundle):
 def test_unloadable_bundle_degrades(monkeypatch, tmp_path):
     bad = tmp_path / "ensemble.joblib"
     bad.write_bytes(b"not a pickle")
-    monkeypatch.setattr(main, "MODEL_PATH", str(bad))
+    monkeypatch.setattr(config, "MODEL_PATH", str(bad))
     assert _real_load_bundle() is None
-    monkeypatch.setattr(main, "MODEL_PATH", str(tmp_path / "missing.joblib"))
+    monkeypatch.setattr(config, "MODEL_PATH", str(tmp_path / "missing.joblib"))
     assert _real_load_bundle() is None
 
 
 def _fallback_predict(lookup):
-    return main.run_predictions_batch(
-        lookup.copy(), main._weather_fallback(), main.get_temporal(FIXED_UTC))
+    return model.run_predictions_batch(
+        lookup.copy(), weather_feed.weather_fallback(), model.get_temporal(FIXED_UTC))
 
 
 def test_full_lookup_fallback_predictions(with_bundle, tract_lookup):
@@ -89,5 +89,5 @@ def test_missing_features_use_training_fill(with_bundle, tract_lookup):
     # Without per-tract weather columns the shared scalars and training
     # medians apply; the result must stay finite (no zero-filled features).
     lean = tract_lookup[["GEOID", "lat", "lon"]].head(50).copy()
-    preds = main.run_predictions_batch(lean, {}, main.get_temporal(FIXED_UTC))
+    preds = model.run_predictions_batch(lean, {}, model.get_temporal(FIXED_UTC))
     assert np.isfinite(preds).all() and (preds > 0).all()

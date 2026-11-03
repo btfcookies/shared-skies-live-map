@@ -11,11 +11,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-import backend.main as main
-from backend import airquality
+from backend import airquality, config, model, predictions, weather_feed
 from backend.purpleair import MIN_LIVE_SENSORS, NBR_RADII_KM, compute_neighbor_features
 
-PIPELINE_DIR = os.path.join(main.ROOT, "pipeline")
+PIPELINE_DIR = os.path.join(config.ROOT, "pipeline")
 
 
 def _load_pipeline_module(filename):
@@ -123,7 +122,7 @@ def test_calendar_uses_utc_day():
     # 21:30 CDT on Oct 20 is already Oct 21 in UTC, the day training uses.
     from zoneinfo import ZoneInfo
     local = datetime(2026, 10, 20, 21, 30, tzinfo=ZoneInfo("America/Chicago"))
-    t = main.get_temporal(local)
+    t = model.get_temporal(local)
     utc_day = date(2026, 10, 21)
     assert t == {"month": 10, "dow": utc_day.weekday(),
                  "day_of_year": utc_day.timetuple().tm_yday}
@@ -133,7 +132,7 @@ def test_calendar_uses_utc_day():
 def test_calendar_matches_training_conventions():
     # Training: pandas dt.month / dt.dayofweek (Mon=0) / dt.dayofyear.
     for ts in pd.date_range("2026-01-01", "2026-12-31 23:00", freq="37h", tz="UTC"):
-        t = main.get_temporal(ts.to_pydatetime())
+        t = model.get_temporal(ts.to_pydatetime())
         assert (t["month"], t["dow"], t["day_of_year"]) == (ts.month, ts.dayofweek, ts.dayofyear)
 
 
@@ -145,9 +144,9 @@ def test_calendar_default_is_utc_now(monkeypatch):
         def now(cls, tz=None):
             return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
 
-    monkeypatch.setattr(main, "datetime", FrozenDatetime)
+    monkeypatch.setattr(model, "datetime", FrozenDatetime)
     # Dec 31 local evening is Jan 1 in UTC.
-    assert main.get_temporal() == {"month": 1, "dow": date(2027, 1, 1).weekday(),
+    assert model.get_temporal() == {"month": 1, "dow": date(2027, 1, 1).weekday(),
                                    "day_of_year": 1}
 
 
@@ -170,10 +169,13 @@ def test_compute_path_passes_utc_calendar(client, monkeypatch, no_snapshots):
         seen["columns"] = set(lookup_reset.columns)
         raise Stop
 
-    monkeypatch.setattr(main, "datetime", FrozenDatetime)
-    monkeypatch.setattr(main, "_predict_and_package", spy)
+    # The compute path reads the clock in both modules: get_temporal() lives in
+    # model, the rest of the compute in predictions.
+    monkeypatch.setattr(model, "datetime", FrozenDatetime)
+    monkeypatch.setattr(predictions, "datetime", FrozenDatetime)
+    monkeypatch.setattr(predictions, "_predict_and_package", spy)
     with pytest.raises(Stop):
-        asyncio.run(main._compute_texas_predictions())
+        asyncio.run(predictions._compute_texas_predictions())
     assert seen["temporal"] == {"month": 10, "dow": 2, "day_of_year": 294}
 
 
@@ -222,16 +224,16 @@ def test_old_mean_wind_snapshot_is_not_reused():
     feats = {"wind_speed": [3.0, 3.0]}
     current = {"usable": True, "schema": airquality.WEATHER_GRID_SCHEMA, "features": feats}
     legacy = {"usable": True, "features": feats}               # pre-schema, daily mean
-    assert main._grid_matches(current, 2, airquality.WEATHER_GRID_SCHEMA)
-    assert not main._grid_matches(legacy, 2, airquality.WEATHER_GRID_SCHEMA)
-    assert not main._grid_matches({**legacy, "schema": 1}, 2, airquality.WEATHER_GRID_SCHEMA)
-    assert not main._grid_matches(current, 3, airquality.WEATHER_GRID_SCHEMA)
+    assert weather_feed._grid_matches(current, 2, airquality.WEATHER_GRID_SCHEMA)
+    assert not weather_feed._grid_matches(legacy, 2, airquality.WEATHER_GRID_SCHEMA)
+    assert not weather_feed._grid_matches({**legacy, "schema": 1}, 2, airquality.WEATHER_GRID_SCHEMA)
+    assert not weather_feed._grid_matches(current, 3, airquality.WEATHER_GRID_SCHEMA)
 
 
 # ── Spatial features ─────────────────────────────────────────────────────────
 
 def test_training_sensors_file():
-    sensors = main._load_training_sensors()
+    sensors = model.load_training_sensors()
     assert len(sensors) == 467
     assert all(np.isfinite([s["lat"], s["lon"]]).all() for s in sensors)
     assert len({s["sensor_id"] for s in sensors}) == len(sensors)
@@ -242,7 +244,7 @@ def test_training_sensors_match_parquet_export():
     tracked training parquet, so a clean clone serves the training feature."""
     export = _load_pipeline_module("14_export_training_sensors.py")
     sensors = export.training_sensors(pd.read_parquet(export.PARQUET_PATH))
-    with open(main.TRAINING_SENSORS_PATH) as f:
+    with open(config.TRAINING_SENSORS_PATH) as f:
         committed = json.load(f)
     assert [r["sensor_id"] for r in committed] == [
         int(s) if isinstance(s, (int, np.integer)) else str(s) for s in sensors["sensor_id"]]
@@ -255,31 +257,31 @@ def test_dist_to_nearest_sensor_from_training_sensors(tract_lookup):
     assert len(d) == 6896 and np.isfinite(d).all()
     assert np.median(d) == pytest.approx(7.80, abs=0.05)
     assert np.percentile(d, 90) == pytest.approx(54.0, abs=0.5)
-    assert d.max() <= main.DIST_TO_SENSOR_MAX_KM
+    assert d.max() <= config.DIST_TO_SENSOR_MAX_KM
     # The legacy 240-sensor file gave a median of ~11 km; it must not be used.
     assert np.median(d) < 9.0
 
 
 def test_missing_training_sensors_is_loud_not_silent(tract_lookup, monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(main, "TRAINING_SENSORS_PATH", str(tmp_path / "missing.json"))
+    monkeypatch.setattr(config, "TRAINING_SENSORS_PATH", str(tmp_path / "missing.json"))
     df = tract_lookup[["GEOID", "lat", "lon"]].head(20).copy()
-    main._enrich_tract_lookup_with_distances(df)
-    assert (df["dist_to_nearest_sensor"] == main.DIST_TO_SENSOR_MAX_KM).all()
+    model.enrich_tract_lookup_with_distances(df)
+    assert (df["dist_to_nearest_sensor"] == config.DIST_TO_SENSOR_MAX_KM).all()
     assert "WARNING" in capsys.readouterr().out
 
 
 def test_spatial_reference_points_match_training():
-    assert main.TX_COAST_POINTS == [tuple(p) for p in _training_constant("TX_COAST_POINTS")]
-    assert main.TX_URBAN_POINTS == [tuple(p) for p in _training_constant("TX_URBAN_POINTS")]
+    assert model.TX_COAST_POINTS == [tuple(p) for p in _training_constant("TX_COAST_POINTS")]
+    assert model.TX_URBAN_POINTS == [tuple(p) for p in _training_constant("TX_URBAN_POINTS")]
 
 
 def test_dist_to_coast_is_haversine_km(with_bundle):
     # Houston is ~76 km from the nearest coast point (the removed degree-based
     # formula gave 1.37).
-    d = main._min_dist_to_points(np.array([29.76]), np.array([-95.37]), main.TX_COAST_POINTS)
+    d = model._min_dist_to_points(np.array([29.76]), np.array([-95.37]), model.TX_COAST_POINTS)
     assert d[0] == pytest.approx(75.9, abs=0.5)
     # A frame without the column gets the same formula inside the batch.
     df = pd.DataFrame({"GEOID": ["48201000100"], "lat": [29.76], "lon": [-95.37]})
-    a = main.run_predictions_batch(df.copy(), {}, main.get_temporal())
-    b = main.run_predictions_batch(df.assign(dist_to_coast=d), {}, main.get_temporal())
+    a = model.run_predictions_batch(df.copy(), {}, model.get_temporal())
+    b = model.run_predictions_batch(df.assign(dist_to_coast=d), {}, model.get_temporal())
     assert a[0] == b[0]

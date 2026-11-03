@@ -12,6 +12,8 @@ import numpy as np
 import pytest
 
 import backend.main as main
+from backend import limits, placement, visits
+from backend.state import EPOCH
 from backend.ratelimit import RecentKeys
 
 TOP_LEVEL_KEYS = ["region", "display_name", "generated_at", "expires_at", "weather",
@@ -167,20 +169,20 @@ def test_city_and_tract_match_the_map(client, predictions):
 
 @pytest.fixture
 def fresh_visits(monkeypatch):
-    monkeypatch.setattr(main, "_visit_dedupe", RecentKeys(main.VISIT_DEDUPE_MIN * 60.0))
-    monkeypatch.setattr(main, "_public_visits_cache",
-                        {"count": None, "expires": main._EPOCH})
+    monkeypatch.setattr(limits, "visit_dedupe", RecentKeys(limits.VISIT_DEDUPE_MIN * 60.0))
+    monkeypatch.setattr(visits, "_public_visits_cache",
+                        {"count": None, "expires": EPOCH})
 
 
 def test_visit_counts_once_per_ip(client, fresh_visits):
-    start = main._get_visit_count_sync()
+    start = visits._get_visit_count_sync()
 
     def visit(xff):
         r = client.post("/api/visit", headers={"X-Forwarded-For": xff})
         assert r.status_code == 200
         body = r.json()
         assert set(body) == {"visits"} and isinstance(body["visits"], int)
-        return main._get_visit_count_sync()
+        return visits._get_visit_count_sync()
 
     assert visit("203.0.113.10") == start + 1
     assert visit("203.0.113.10") == start + 1
@@ -189,8 +191,8 @@ def test_visit_counts_once_per_ip(client, fresh_visits):
 
 
 def test_visit_window_is_30_min():
-    assert main.VISIT_DEDUPE_MIN == 30
-    assert main._visit_dedupe.ttl_s == 30 * 60
+    assert limits.VISIT_DEDUPE_MIN == 30
+    assert limits.visit_dedupe.ttl_s == 30 * 60
 
 
 def test_metrics_shape(client):
@@ -226,12 +228,12 @@ def test_sensor_placement_cold_requests_share_one_solve(client, monkeypatch):
         while not release.is_set():
             await asyncio.sleep(0.01)
         result = {"methods": {}, "existing_sensors": [], "num_existing_sensors": 0}
-        main._quantum_cache = {"data": result,
+        placement.quantum_cache = {"data": result,
                                "expires": datetime.now(timezone.utc) + timedelta(hours=1)}
         return result
 
-    monkeypatch.setattr(main, "_quantum_cache", {"data": None, "expires": main._EPOCH})
-    monkeypatch.setattr(main, "_solve_quantum_and_cache", fake_solve)
+    monkeypatch.setattr(placement, "quantum_cache", {"data": None, "expires": EPOCH})
+    monkeypatch.setattr(placement, "solve_quantum_and_cache", fake_solve)
 
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = [pool.submit(client.get, "/api/quantum/sensor-placement") for _ in range(5)]
@@ -257,13 +259,13 @@ def test_solver_inputs_from_main(client, monkeypatch):
 
     monkeypatch.setattr(qubo_solver, "solve_quantum", fake_solve)
     monkeypatch.setattr(qubo_solver, "compute_coverage", lambda *a, **k: {})
-    result = asyncio.run(main._run_quantum_placement())
+    result = asyncio.run(placement._run_quantum_placement())
 
     kw = seen["kwargs"]
     assert (kw["k"], kw["num_reads"], kw["top_candidates"], kw["proximity_threshold_miles"]) == (
         25, 500, 120, 8.0)
     md = kw["model_disagreement"]
-    residuals = main._load_loso_residuals()
+    residuals = placement._load_loso_residuals()
     known = np.array([str(t["geoid"]) in residuals for t in seen["tracts"]])
     assert md.dtype == np.float64 and len(md) == len(seen["tracts"]) == 6896
     assert 0 < known.sum() < len(known)

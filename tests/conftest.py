@@ -91,19 +91,19 @@ def net():
 @pytest.fixture
 def no_snapshots(monkeypatch):
     """Keep a test's fake data out of the snapshot dir the app hydrates from."""
-    import backend.main as main
+    from backend import snapshots
 
     async def _skip(path, data):
         return None
 
-    monkeypatch.setattr(main, "_save_snapshot_async", _skip)
+    monkeypatch.setattr(snapshots, "save_async", _skip)
 
 
 @pytest.fixture(scope="session")
 def bundle():
     """The deployed model bundle, loaded once for the whole session."""
-    import backend.main as main
-    b = main._load_bundle()
+    from backend import model
+    b = model.load_bundle()
     assert b is not None, "models/ensemble.joblib failed to load"
     return b
 
@@ -122,10 +122,10 @@ def tract_lookup():
     """The tract lookup enriched exactly as the lifespan does it. Read-only:
     copy before mutating."""
     import pandas as pd
-    import backend.main as main
-    df = pd.read_parquet(main.LOOKUP_PATH)
+    from backend import config, model
+    df = pd.read_parquet(config.LOOKUP_PATH)
     df["GEOID"] = df["GEOID"].astype(str).str.zfill(11)
-    main._enrich_tract_lookup_with_distances(df)
+    model.enrich_tract_lookup_with_distances(df)
     return df
 
 
@@ -136,10 +136,11 @@ def client(_offline_httpx, bundle, tmp_path_factory):
     the first placement solve have finished."""
     from fastapi.testclient import TestClient
     import backend.main as main
+    from backend import model, visits
 
     mp = pytest.MonkeyPatch()
-    mp.setattr(main, "_load_bundle", lambda: bundle)
-    mp.setattr(main, "VISITS_DB", str(tmp_path_factory.mktemp("visits") / "visits.sqlite"))
+    mp.setattr(model, "load_bundle", lambda: bundle)
+    mp.setattr(visits, "VISITS_DB", str(tmp_path_factory.mktemp("visits") / "visits.sqlite"))
     try:
         with TestClient(main.app) as c:
             # Blocks until the refresh loop's startup compute lands.
